@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.nbc
+*.nbi
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# YOLO model weights (large, download separately)
+*.pt
+
+# Face database (user-specific enrolled faces)
+face_database/
+
+# Calibration data (camera-specific)
+calibration/*.npz
+calibration/*.jpg
+
+# Legacy files (replaced by face_recognition_insightface.py)
+face_recognition_system.py
+quick_setup_faces.py
+manage_faces.py
+debug_script.py
+face_recognition_example.py
+facial_advanced.py
+facial.py
+quick_check.py
+standing1.2.py
+test_face_recognition.py
+_bench.py
+
+# Scrcpy binaries (downloaded separately)
+scrcpy/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Temp files
+*.tmp
+*.log

@@ -1,0 +1,355 @@
+"""
+SIGO Face Recognition — ArcFace via ONNX Runtime
+=================================================
+Uses YOLOv8-pose keypoints for face localization (FREE — already computed),
+ArcFace w600k_r50 for 512-dim embeddings via ONNX Runtime GPU.
+
+No InsightFace Python package needed — direct ONNX inference.
+"""
+import cv2
+import numpy as np
+import os
+import pickle
+import time
+import threading
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+# ─── ArcFace reference landmarks for 112×112 alignment ────────────────────
+# Standard 3-point subset (left eye, right eye, nose) used for affine warp
+ARCFACE_REF_3PT = np.array([
+    [38.2946, 51.6963],   # left eye
+    [73.5318, 51.5014],   # right eye
+    [56.0252, 71.7366],   # nose tip
+], dtype=np.float32)
+
+
+# ─── Ensure CUDA / cuDNN DLLs from PyTorch are visible to ONNX Runtime ────
+def _setup_cuda_dll_paths():
+    """Add PyTorch's bundled CUDA 12 + cuDNN 9 DLLs to the DLL search path
+    so ONNX Runtime can find them on Windows."""
+    try:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), 'lib')
+        if os.path.isdir(torch_lib):
+            os.add_dll_directory(torch_lib)
+    except Exception:
+        pass
+
+if os.name == 'nt':
+    _setup_cuda_dll_paths()
+
+
+# ─── ArcFace ONNX wrapper ─────────────────────────────────────────────────
+class ArcFaceONNX:
+    """ArcFace face recognition — loads w600k_r50.onnx, returns 512-dim embeddings."""
+
+    def __init__(self, model_path: str = None):
+        import onnxruntime as ort
+
+        if model_path is None:
+            model_path = os.path.expanduser(
+                '~/.insightface/models/buffalo_l/w600k_r50.onnx'
+            )
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"ArcFace model not found: {model_path}")
+
+        # Prefer GPU, fallback to CPU
+        providers = []
+        if 'CUDAExecutionProvider' in ort.get_available_providers():
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        active = self.session.get_providers()
+        print(f"[FaceRec] ArcFace loaded — provider: {active[0]}")
+
+    def get_embedding(self, aligned_face: np.ndarray) -> np.ndarray:
+        """Get 512-dim L2-normalised embedding from an aligned 112×112 face.
+
+        Args:
+            aligned_face: BGR image, already warped to 112×112
+        Returns:
+            512-dim unit-length embedding
+        """
+        img = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img = (img / 127.5) - 1.0                      # normalise to [-1, 1]
+        img = img.transpose(2, 0, 1)[np.newaxis, ...]   # HWC → 1×C×H×W
+
+        embedding = self.session.run(
+            [self.output_name], {self.input_name: img}
+        )[0].flatten()
+
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding /= norm
+        return embedding
+
+    @staticmethod
+    def similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
+        """Cosine similarity (both are already L2-normalised)."""
+        return float(np.dot(emb1, emb2))
+
+
+# ─── Face alignment helper ────────────────────────────────────────────────
+def align_face(
+    frame: np.ndarray,
+    left_eye: np.ndarray,
+    right_eye: np.ndarray,
+    nose: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Warp a face to the ArcFace 112×112 template using 3-point affine.
+
+    Args:
+        frame:     Full BGR frame
+        left_eye:  (x, y) array
+        right_eye: (x, y) array
+        nose:      (x, y) array
+    Returns:
+        Aligned 112×112 face, or *None* if the geometry is degenerate.
+    """
+    eye_dist = np.linalg.norm(left_eye - right_eye)
+    if eye_dist < 5:
+        return None
+
+    src = np.array([left_eye, right_eye, nose], dtype=np.float32)
+    M = cv2.getAffineTransform(src, ARCFACE_REF_3PT)
+    return cv2.warpAffine(frame, M, (112, 112), borderValue=(0, 0, 0))
+
+
+# ─── Pickle-based face database ───────────────────────────────────────────
+class FaceDatabase:
+    """Stores {name → list of 512-dim embeddings} on disk."""
+
+    def __init__(self, database_dir: str = "face_database"):
+        self.database_dir = Path(database_dir)
+        self.db_file = self.database_dir / "face_db.pkl"
+        self.database_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.people: Dict[str, dict] = {}
+        self._load()
+
+    # ── persistence ────────────────────────────────────────────────────
+    def _load(self):
+        if self.db_file.exists():
+            try:
+                with open(self.db_file, 'rb') as f:
+                    self.people = pickle.load(f)
+                print(f"[FaceDB] Loaded {len(self.people)} people "
+                      f"({sum(len(v['embeddings']) for v in self.people.values())} embeddings)")
+            except Exception as e:
+                print(f"[FaceDB] Load error: {e}, starting fresh")
+                self.people = {}
+        else:
+            print("[FaceDB] No existing database — starting fresh")
+
+    def _save(self):
+        try:
+            with open(self.db_file, 'wb') as f:
+                pickle.dump(self.people, f)
+        except Exception as e:
+            print(f"[FaceDB] Save error: {e}")
+
+    # ── add / remove / query ───────────────────────────────────────────
+    def add_face(self, name: str, embedding: np.ndarray,
+                 face_image: np.ndarray = None) -> bool:
+        with self.lock:
+            if name not in self.people:
+                self.people[name] = {'embeddings': [], 'enrolled_at': time.time()}
+            self.people[name]['embeddings'].append(embedding)
+
+            if face_image is not None:
+                img_dir = self.database_dir / name
+                img_dir.mkdir(exist_ok=True)
+                ts = int(time.time() * 1000)
+                cv2.imwrite(str(img_dir / f"enrolled_{ts}.jpg"), face_image)
+
+            self._save()
+            return True
+
+    def recognize(self, embedding: np.ndarray,
+                  threshold: float = 0.35) -> Tuple[Optional[str], float]:
+        best_name, best_sim = None, -1.0
+        with self.lock:
+            for name, data in self.people.items():
+                for db_emb in data['embeddings']:
+                    sim = float(np.dot(embedding, db_emb))
+                    if sim > best_sim:
+                        best_sim, best_name = sim, name
+        if best_sim >= threshold:
+            return best_name, best_sim
+        return None, 0.0
+
+    def remove_person(self, name: str) -> bool:
+        with self.lock:
+            if name in self.people:
+                del self.people[name]
+                self._save()
+                img_dir = self.database_dir / name
+                if img_dir.exists():
+                    import shutil
+                    shutil.rmtree(img_dir, ignore_errors=True)
+                return True
+        return False
+
+    def list_people(self) -> List[str]:
+        with self.lock:
+            return list(self.people.keys())
+
+
+# ─── Main recognition system ──────────────────────────────────────────────
+class LiveFaceRecognition:
+    """Complete pipeline: pose-keypoints → ArcFace alignment → recognition.
+
+    Face *detection* is free — we reuse the YOLOv8-pose keypoints
+    (nose=0, left_eye=1, right_eye=2) that are already computed.
+    Only the ArcFace embedding inference is extra work (~5-10 ms on GPU).
+    """
+
+    KP_NOSE      = 0
+    KP_LEFT_EYE  = 1
+    KP_RIGHT_EYE = 2
+
+    def __init__(
+        self,
+        model_path: str = None,
+        database_dir: str = "face_database",
+        recognition_threshold: float = 0.35,
+        min_eye_dist: float = 15.0,
+        cooldown: float = 1.0,
+        cache_ttl: float = 5.0,
+    ):
+        """
+        Args:
+            model_path:  Path to w600k_r50.onnx (None → default location)
+            database_dir:  Where face_db.pkl lives
+            recognition_threshold:  Cosine sim cutoff (0.3 = lenient, 0.5 = strict)
+            min_eye_dist:  Skip faces smaller than this (pixels between eyes)
+            cooldown:  Seconds between recognition attempts per person
+            cache_ttl:  Seconds to trust a cached recognition result
+        """
+        self.arcface  = ArcFaceONNX(model_path)
+        self.database = FaceDatabase(database_dir)
+        self.threshold   = recognition_threshold
+        self.min_eye_dist = min_eye_dist
+        self.cooldown    = cooldown
+        self.cache_ttl   = cache_ttl
+
+        # Per-person recognition cache
+        self._cache: Dict[str, Tuple[str, float, float]] = {}   # pid → (name, sim, ts)
+        self._last_attempt: Dict[str, float] = {}               # pid → ts
+        self._lock = threading.Lock()
+
+    # ── face extraction from pose keypoints ────────────────────────────
+    def extract_face(self, frame: np.ndarray,
+                     keypoints: np.ndarray) -> Optional[np.ndarray]:
+        """Crop & align a 112×112 face using YOLOv8-pose keypoints.
+
+        Args:
+            frame:     Full BGR frame
+            keypoints: (17, 3) array — (x, y, confidence) per keypoint
+        Returns:
+            Aligned 112×112 face or *None*
+        """
+        if keypoints is None or len(keypoints) < 3:
+            return None
+
+        nose_c = keypoints[self.KP_NOSE][2]
+        leye_c = keypoints[self.KP_LEFT_EYE][2]
+        reye_c = keypoints[self.KP_RIGHT_EYE][2]
+
+        if leye_c < 0.3 or reye_c < 0.3 or nose_c < 0.3:
+            return None
+
+        left_eye  = keypoints[self.KP_LEFT_EYE][:2].astype(np.float32)
+        right_eye = keypoints[self.KP_RIGHT_EYE][:2].astype(np.float32)
+        nose      = keypoints[self.KP_NOSE][:2].astype(np.float32)
+
+        if np.linalg.norm(left_eye - right_eye) < self.min_eye_dist:
+            return None
+
+        return align_face(frame, left_eye, right_eye, nose)
+
+    # ── recognition (with cache + cooldown) ────────────────────────────
+    def recognize_person(self, frame: np.ndarray, keypoints: np.ndarray,
+                         person_id: str) -> Tuple[Optional[str], float]:
+        """Try to identify a tracked person.
+
+        Returns (name, similarity) or (None, 0.0).
+        Uses per-person cooldown and result caching to stay cheap.
+        """
+        if not self.database.people:
+            return None, 0.0
+
+        now = time.time()
+
+        with self._lock:
+            # return non-expired cache hit
+            if person_id in self._cache:
+                name, sim, ts = self._cache[person_id]
+                if now - ts < self.cache_ttl:
+                    return name, sim
+
+            # respect cooldown
+            last = self._last_attempt.get(person_id, 0)
+            if now - last < self.cooldown:
+                cached = self._cache.get(person_id)
+                return (cached[0], cached[1]) if cached else (None, 0.0)
+            self._last_attempt[person_id] = now
+
+        aligned = self.extract_face(frame, keypoints)
+        if aligned is None:
+            return None, 0.0
+
+        embedding = self.arcface.get_embedding(aligned)
+        name, sim = self.database.recognize(embedding, self.threshold)
+
+        if name:
+            with self._lock:
+                self._cache[person_id] = (name, sim, now)
+        return name, sim
+
+    # ── live enrollment ────────────────────────────────────────────────
+    def enroll_person(self, frame: np.ndarray, keypoints: np.ndarray,
+                      name: str) -> Tuple[bool, str]:
+        """Enroll a person's face from the current frame.
+
+        Returns (success, message).
+        """
+        aligned = self.extract_face(frame, keypoints)
+        if aligned is None:
+            return False, "No se detectó cara. Asegúrate de que la persona esté mirando a la cámara."
+
+        embedding = self.arcface.get_embedding(aligned)
+        self.database.add_face(name, embedding, aligned)
+
+        # invalidate caches so the new enrolment takes effect immediately
+        with self._lock:
+            self._cache.clear()
+            self._last_attempt.clear()
+
+        n = len(self.database.people[name]['embeddings'])
+        return True, f"'{name}' guardado ({n} embedding{'s' if n > 1 else ''})"
+
+    # ── utilities ──────────────────────────────────────────────────────
+    def list_people(self) -> List[str]:
+        return self.database.list_people()
+
+    def remove_person(self, name: str) -> bool:
+        ok = self.database.remove_person(name)
+        if ok:
+            with self._lock:
+                self._cache.clear()
+                self._last_attempt.clear()
+        return ok
+
+    def clear_cache(self, person_id: str = None):
+        with self._lock:
+            if person_id:
+                self._cache.pop(person_id, None)
+                self._last_attempt.pop(person_id, None)
+            else:
+                self._cache.clear()
+                self._last_attempt.clear()

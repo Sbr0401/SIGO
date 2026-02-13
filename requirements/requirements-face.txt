@@ -1,0 +1,14 @@
+# Face Recognition Requirements for SIGO
+# Install with: pip install -r requirements-face.txt
+# Updated: February 2026
+
+# ONNX Runtime GPU (ArcFace inference — ~10ms/face on GPU)
+# Reuses CUDA 12 + cuDNN 9 DLLs bundled with PyTorch automatically
+onnxruntime-gpu>=1.19.0
+
+# Note: The ArcFace model (w600k_r50.onnx from InsightFace buffalo_l pack)
+# is downloaded automatically on first run (~174MB).
+# No InsightFace Python package needed — direct ONNX inference.
+#
+# CPU-only alternative (no NVIDIA GPU): replace onnxruntime-gpu with:
+#   onnxruntime>=1.19.0

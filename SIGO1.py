@@ -1,0 +1,3111 @@
+#!/usr/bin/env python3
+"""
+SIGO - Sistema Integrado de Gestión de Objetivo
+AI-Powered ArUco Marker Navigation System
+Version: 2.0 - Refactored
+"""
+import cv2
+import numpy as np
+import re
+import time
+import threading
+from collections import OrderedDict, deque
+from queue import Queue, Full, Empty
+from ultralytics import YOLO
+from openai import OpenAI
+import os
+import keyboard
+from faster_whisper import WhisperModel
+import sounddevice as sd
+from scipy.io.wavfile import write
+import tempfile
+import torch
+import socket
+import asyncio
+from dataclasses import dataclass
+from typing import Optional, List
+import numpy.typing as npt
+try:
+    import win32gui
+    import win32ui
+    import win32con
+    SCRCPY_AVAILABLE = True
+except ImportError:
+    SCRCPY_AVAILABLE = False
+
+import serial
+
+# Facial recognition system (ArcFace via ONNX Runtime)
+try:
+    from face_recognition_insightface import LiveFaceRecognition
+    FACE_RECOGNITION_AVAILABLE = True
+except ImportError:
+    FACE_RECOGNITION_AVAILABLE = False
+    print("⚠️ Face recognition not available. Ensure onnxruntime-gpu and ArcFace model are installed.")
+
+# Import centralized configuration
+try:
+    from config import Config
+except ImportError:
+    print("⚠️ config.py no encontrado, usando valores por defecto")
+    # Fallback to inline config if config.py missing
+    class Config:
+        class Hardware:
+            SERIAL_PORT = 'COM8'
+            SERIAL_BAUD = 9600
+            CAMERA_IP = "192.168.165.106"
+            VEHICLE_IP = "192.168.165.76"
+            ESP_PORT = 5555
+        class AI:
+            OPENAI_MODEL = "gpt-4o-mini"
+            WHISPER_MODEL_SIZE = "tiny"
+            WHISPER_LANGUAGE = "es"
+            YOLO_CONFIDENCE = 0.5
+        class Navigation:
+            DISTANCE_TARGET = 0.3
+            ROTATION_THRESHOLD = 5
+            MARKER_LOST_TIMEOUT = 3.0
+        class Vision:
+            ARUCO_MARKER_SIZE = 0.20
+            SMOOTH_WINDOW_SIZE = 5
+
+# ==========================
+#  CONFIG WHISPER / AUDIO
+# ==========================
+WHISPER_MODEL = None  # Lazy load
+WHISPER_USE_CUDA = torch.cuda.is_available()
+WHISPER_SAMPLE_RATE = getattr(Config.AI, 'WHISPER_SAMPLE_RATE', 16000)
+
+def get_whisper_model():
+    """Lazy load Whisper model on first use (faster-whisper version)"""
+    global WHISPER_MODEL
+    if WHISPER_MODEL is None:
+        print("🧠 Cargando modelo Whisper (primera vez - faster-whisper)...")
+        model_size = getattr(Config.AI, 'WHISPER_MODEL_SIZE', 'tiny')
+        device = "cuda" if WHISPER_USE_CUDA else "cpu"
+        compute_type = "float16" if WHISPER_USE_CUDA else "int8"
+        WHISPER_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+        print("✅ Modelo Whisper listo (4-8x más rápido!)")
+    return WHISPER_MODEL
+
+# ==========================
+#  CONFIG SERIAL/WIFI
+# ==========================
+PUERTO = getattr(Config.Hardware, 'SERIAL_PORT', 'COM8')
+BAUD   = getattr(Config.Hardware, 'SERIAL_BAUD', 9600)
+
+CamIP = getattr(Config.Hardware, 'CAMERA_IP', '192.168.165.106')
+CarIP = getattr(Config.Hardware, 'VEHICLE_IP', '192.168.165.76')
+ESP_PORT = getattr(Config.Hardware, 'ESP_PORT', 5555)
+
+# --- Adaptador unificado de control (Serial o WiFi) ---
+class ControlLink:
+    def __init__(self, mode: str, serial_port='COM8', serial_baud=9600, serial_timeout=1, wifi_ip=None, wifi_port=None):
+        """
+        mode: 'serial' o 'wifi'
+        """
+        self.mode = mode
+        self.serial_port = serial_port
+        self.serial_baud = serial_baud
+        self.serial_timeout = serial_timeout
+        self.wifi_ip = wifi_ip
+        self.wifi_port = wifi_port
+
+        self._ser = None   # serial.Serial()
+        self._sock = None  # socket.socket()
+
+    def open(self):
+        if self.mode == 'serial':
+            if self._ser is None:
+                self._ser = serial.Serial()
+                self._ser.port = self.serial_port
+                self._ser.baudrate = self.serial_baud
+                self._ser.timeout = self.serial_timeout
+            if not self._ser.is_open:
+                self._ser.open()
+            print(f"✅ [CTRL] Serial abierto en {self._ser.port}@{self._ser.baudrate}")
+
+        elif self.mode == 'wifi':
+            # si no hay conexión, conectar (create fresh socket if stale)
+            try:
+                if self._sock is not None:
+                    self._sock.getpeername()  # raises if not connected
+                else:
+                    raise OSError("No socket")
+            except Exception:
+                # Close stale socket if any, then create a fresh one
+                if self._sock is not None:
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(3)
+                self._sock.connect((self.wifi_ip, self.wifi_port))
+            print(f"✅ [CTRL] WiFi conectado a {self.wifi_ip}:{self.wifi_port}")
+
+    def send(self, b: int):
+        """Envía un solo byte (0-255) por el medio seleccionado."""
+        b = int(b) & 0xFF
+        if self.mode == 'serial':
+            if not self._ser or not self._ser.is_open:
+                raise RuntimeError("Serial no abierto - revisa conexión USB")
+            try:
+                self._ser.write(bytes([b]))
+                self._ser.flush()
+            except serial.SerialTimeoutException:
+                raise RuntimeError("Timeout serial - dispositivo no responde")
+            except serial.SerialException as e:
+                raise RuntimeError(f"Error serial: {e}")
+        elif self.mode == 'wifi':
+            if not self._sock:
+                raise RuntimeError("Socket no abierto - revisa conexión WiFi")
+            try:
+                self._sock.sendall(bytes([b]))
+            except socket.timeout:
+                raise RuntimeError("Timeout WiFi - ESP no responde (verifica IP/conexión)")
+            except (BrokenPipeError, ConnectionResetError) as e:
+                raise RuntimeError(f"Conexión WiFi perdida: {e}")
+            except socket.error as e:
+                raise RuntimeError(f"Error de red: {e}")
+
+    def close(self):
+        """Por convención, siempre intentamos mandar 0 antes de cerrar."""
+        try:
+            self.send(0)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+        if self.mode == 'serial':
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+                print("❎ [CTRL] Serial cerrado")
+        elif self.mode == 'wifi':
+            if self._sock:
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self._sock.close()
+                print("❎ [CTRL] Socket WiFi cerrado")
+        self._ser = None
+        self._sock = None
+
+# Instancia global que configuramos en __main__ según la fuente
+control = None
+
+# ==========================
+# ==========================
+#  CONFIGURA LLM (Manual/Auto)
+# ==========================
+def configure_llm_mode():
+    """
+    Selects between Local LLM (Ollama) and OpenAI Cloud.
+    Starts Ollama server automatically if needed.
+    """
+    import subprocess
+    import shutil
+    
+    print("\nCheck LLM Configuration...")
+    
+    # 1. Check if we want to force local or cloud
+    # We default to LOCAL if Ollama is installed, otherwise CLOUD
+    ollama_path = shutil.which("ollama")
+    use_local = False
+    
+    if ollama_path:
+        print("✅ Ollama detected. Attempting to use Local LLM.")
+        use_local = True
+        
+        # Start server if not running
+        try:
+            # Check if server is running (simple check)
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', 11434))
+            sock.close()
+            
+            if result != 0:
+                print("⏳ Starting Ollama server...")
+                subprocess.Popen(["ollama", "serve"], 
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                time.sleep(3) # Give it a moment
+        except:
+            pass
+            
+        # Set config for Local
+        os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
+        os.environ["OPENAI_MODEL"] = "llama3.1"
+        os.environ["OPENAI_API_KEY"] = "ollama"
+        
+        # Check if model exists, pull if not (non-blocking if possible, but we need it)
+        # We'll rely on the user having pulled it, or fallback to cloud if fails?
+        # For now, simplistic approach:
+        print(f"✅ LLM: Local Ollama")
+        print(f"   Model: {os.environ['OPENAI_MODEL']}")
+        print(f"   URL:   {os.environ['OPENAI_BASE_URL']}")
+        
+    else:
+        print("⚠️ Ollama not found or disabled.")
+        print(f"☁️  LLM: OpenAI Cloud API (GPT-4o-mini)")
+        use_local = False
+
+configure_llm_mode()
+
+#  CONFIG OPENAI / OBJETIVOS
+# ==========================
+# Use local LLM if configured, otherwise use default OpenAI
+_base_url = os.environ.get("OPENAI_BASE_URL", getattr(Config.AI, 'OPENAI_BASE_URL', None))
+_api_key = os.environ.get("OPENAI_API_KEY", getattr(Config.AI, 'OPENAI_API_KEY', None))
+_model = os.environ.get("OPENAI_MODEL", getattr(Config.AI, 'OPENAI_MODEL', "gpt-4o-mini"))
+
+client = OpenAI(api_key=_api_key, base_url=_base_url)
+
+# Navigation constants (from Config)
+DISTANCE_TARGET = getattr(Config.Navigation, 'DISTANCE_TARGET', 0.3)
+DIST_CORRECTION = getattr(Config.Navigation, 'DISTANCE_CORRECTION', 1.0)
+YOLO_CONF = getattr(Config.AI, 'YOLO_CONFIDENCE', 0.5)
+OBJECT_SEARCH_TIMEOUT = 1.0
+
+# ArUco marker constants
+ARUCO_MARKER_SIZE = getattr(Config.Vision, 'ARUCO_MARKER_SIZE', 0.20)
+
+# Detection constants
+DETECTION_RADIUS_SCALE = getattr(Config.Navigation, 'DETECTION_RADIUS_SCALE', 2.0)
+ROI_EXPANSION_SCALE = getattr(Config.Vision, 'ROI_EXPANSION_SCALE', 1.2)
+MARKER_EXPIRE_TIME = getattr(Config.Navigation, 'MARKER_EXPIRE_TIME', 2.0)
+SMOOTH_WINDOW_SIZE = getattr(Config.Vision, 'SMOOTH_WINDOW_SIZE', 5)
+
+# Camera correction
+GAMMA_CORRECTION = getattr(Config.Vision, 'GAMMA_CORRECTION', 1.2)
+
+# Configuraciones por tipo de fuente (from Config)
+if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
+    SOURCE_CONFIGS = Config.Source.SOURCES
+else:
+    SOURCE_CONFIGS = {
+        "default": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 5,
+            "target_fps": 30
+        },
+        "scrcpy": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 5,
+            "target_fps": 30
+        },
+        "stream": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval":1,
+            "target_fps": 10,
+            "url": "http://192.168.1.83/stream"
+        }
+    }
+
+# ==========================
+#  DATA STRUCTURES
+# ==========================
+@dataclass
+class MarkerState:
+    """Type-safe marker state data"""
+    id: int
+    corners: npt.NDArray[np.int32]
+    distance: float
+    angle_x: float
+    angle_y: float
+    prev_distance: Optional[float]
+    prev_angle_x: Optional[float]
+    prev_angle_y: Optional[float]
+    last_seen: float
+    draw_box: bool = True
+    last_detection_time: Optional[float] = None
+    
+    @property
+    def is_active(self) -> bool:
+        """Check if marker was seen recently"""
+        return time.time() - self.last_seen <= MARKER_EXPIRE_TIME
+
+@dataclass
+class DetectedObject:
+    """Type-safe detected object data"""
+    class_id: int
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    track_id: Optional[int] = None
+
+# ==========================
+#  CONSOLA GUI
+# ==========================
+class ConsoleBuffer:
+    def __init__(self, max_lines=None, max_history=None):
+        if max_lines is None:
+            max_lines = getattr(getattr(Config, 'UI', None), 'MAX_CONSOLE_LINES', 100)
+        if max_history is None:
+            max_history = getattr(getattr(Config, 'UI', None), 'MAX_COMMAND_HISTORY', 50)
+        
+        self.buffer = deque(maxlen=max_lines)
+        self.current_input = ""
+        self.command_history = deque(maxlen=max_history)
+        self.history_index = -1
+        self.lock = threading.Lock()
+        self._cmd_counter = 0  # Monotonic counter for unique command IDs
+        
+    def add_output(self, text):
+        with self.lock:
+            self.buffer.extend(text.split('\n'))
+        
+    def get_visible_buffer(self):
+        with self.lock:
+            return list(self.buffer)
+        
+    def clear_input(self):
+        with self.lock:
+            self.current_input = ""
+        
+    def add_to_input(self, char):
+        with self.lock:
+            self.current_input += char
+        
+    def backspace(self):
+        with self.lock:
+            self.current_input = self.current_input[:-1]
+    
+    def get_input(self):
+        with self.lock:
+            return self.current_input
+    
+    def add_to_history(self, command):
+        """Add command to history"""
+        with self.lock:
+            if command and (not self.command_history or self.command_history[-1] != command):
+                self.command_history.append(command)
+            self.history_index = -1
+    
+    def history_up(self):
+        """Navigate up in command history"""
+        with self.lock:
+            if not self.command_history:
+                return
+            if self.history_index < len(self.command_history) - 1:
+                self.history_index += 1
+                self.current_input = self.command_history[-(self.history_index + 1)]
+    
+    def history_down(self):
+        """Navigate down in command history"""
+        with self.lock:
+            if self.history_index > 0:
+                self.history_index -= 1
+                self.current_input = self.command_history[-(self.history_index + 1)]
+            elif self.history_index == 0:
+                self.history_index = -1
+                self.current_input = ""
+
+# ==========================
+#  UTIL
+# ==========================
+def compute_fov(fx: float, fy: float, width: int, height: int):
+    """Calculate horizontal and vertical FoV in degrees."""
+    fov_x = 2 * np.degrees(np.arctan(width / (2 * fx)))
+    fov_y = 2 * np.degrees(np.arctan(height / (2 * fy)))
+    return fov_x, fov_y
+
+# ==========================
+#  NUMBA JIT OPTIMIZATIONS
+# ==========================
+try:
+    from numba import jit
+    
+    @jit(nopython=True, cache=True)
+    def calculate_distance_fast(tvec_flat: npt.NDArray[np.float64]) -> float:
+        """JIT-compiled distance calculation (10-100x faster)"""
+        return np.sqrt(tvec_flat[0]**2 + tvec_flat[1]**2 + tvec_flat[2]**2)
+    
+    @jit(nopython=True, cache=True)
+    def calculate_angles_fast(cx: float, cy: float, frame_w: float, frame_h: float, 
+                             fov_x: float, fov_y: float) -> tuple[float, float]:
+        """JIT-compiled angle calculation (10-100x faster)"""
+        ax = ((cx - frame_w/2) / frame_w) * fov_x
+        ay = ((frame_h/2 - cy) / frame_h) * fov_y
+        return ax, ay
+    
+    NUMBA_AVAILABLE = True
+    print("✅ Numba JIT habilitado - cálculos 10-100x más rápidos")
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("⚠️ Numba no disponible - usando cálculos estándar")
+    
+    # Fallback to regular functions
+    def calculate_distance_fast(tvec_flat):
+        return float(np.linalg.norm(tvec_flat))
+    
+    def calculate_angles_fast(cx, cy, frame_w, frame_h, fov_x, fov_y):
+        ax = ((cx - frame_w/2) / frame_w) * fov_x
+        ay = ((frame_h/2 - cy) / frame_h) * fov_y
+        return ax, ay
+
+# ==========================
+#  POSE-BASED DISTANCE ESTIMATION (Alternative to ArUco)
+# ==========================
+import math
+
+# Human body measurements (meters)
+TORSO_AVG_WIDTH_M = 0.40   # Average shoulder width (40cm)
+TORSO_AVG_HEIGHT_M = 0.50  # Average torso height (shoulder to hip)
+HEAD_SHOULDER_M = 0.25     # Average nose-to-shoulder vertical distance (~25cm)
+FULL_HEIGHT_M = 1.70       # Average full person height for bbox fallback
+FOCAL_PIX_DEFAULT = 640.0  # Default focal length in pixels (Lenovo LOQ 15 webcam @ 720p ~600-700px)
+CONF_MIN_KPT = 0.3         # Minimum keypoint confidence (lowered for webcam quality)
+
+# Orientation detection: when frontal, shoulder_width / torso_height ≈ 0.75-0.85
+# When sideways (90°), this ratio drops to ≈ 0.25-0.40
+FRONTAL_RATIO_EXPECTED = 0.80  # shoulder_w / torso_h when facing camera
+SIDEWAYS_RATIO_THRESHOLD = 0.50  # below this => mostly sideways
+
+# COCO keypoint indices (used globally)
+KPT_NOSE = 0
+KPT_L_EYE, KPT_R_EYE = 1, 2
+KPT_L_EAR, KPT_R_EAR = 3, 4
+KPT_L_SH, KPT_R_SH = 5, 6       # shoulders
+KPT_L_ELB, KPT_R_ELB = 7, 8     # elbows
+KPT_L_WRI, KPT_R_WRI = 9, 10    # wrists
+KPT_L_HP, KPT_R_HP = 11, 12     # hips
+KPT_L_KN, KPT_R_KN = 13, 14     # knees
+KPT_L_AN, KPT_R_AN = 15, 16     # ankles
+
+def distance_between_kpts(p1, p2):
+    """Calculate Euclidean distance between two keypoints"""
+    return math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+def _kpt_visible(kpts, idx):
+    """Check if a keypoint is visible (above confidence threshold)"""
+    return idx < len(kpts) and kpts[idx][2] > CONF_MIN_KPT
+
+def estimate_body_orientation(kpts):
+    """
+    Estimate how much the person is facing the camera (0.0 = fully sideways, 1.0 = fully frontal).
+    Uses the ratio of shoulder width to torso height — vertical measurements are
+    rotation-invariant while horizontal ones compress with body rotation.
+    
+    Returns: (frontal_score 0..1, method_used str)
+    """
+    has_shoulders = _kpt_visible(kpts, KPT_L_SH) and _kpt_visible(kpts, KPT_R_SH)
+    has_hips = _kpt_visible(kpts, KPT_L_HP) and _kpt_visible(kpts, KPT_R_HP)
+    
+    # Primary: shoulder width vs torso height ratio
+    if has_shoulders and has_hips:
+        shoulder_w = abs(kpts[KPT_L_SH][0] - kpts[KPT_R_SH][0])
+        torso_h = max(kpts[KPT_L_HP][1], kpts[KPT_R_HP][1]) - min(kpts[KPT_L_SH][1], kpts[KPT_R_SH][1])
+        if torso_h > 5:
+            ratio = shoulder_w / torso_h
+            # Map ratio to 0..1 frontal score
+            # ratio ~0.80 = frontal (score=1.0), ratio ~0.25 = sideways (score=0.0)
+            score = max(0.0, min(1.0, (ratio - 0.25) / (FRONTAL_RATIO_EXPECTED - 0.25)))
+            return score, 'shoulder_torso_ratio'
+    
+    # Secondary: hip width vs torso height (hips rotate similarly)
+    if has_hips and has_shoulders:
+        hip_w = abs(kpts[KPT_L_HP][0] - kpts[KPT_R_HP][0])
+        torso_h = max(kpts[KPT_L_HP][1], kpts[KPT_R_HP][1]) - min(kpts[KPT_L_SH][1], kpts[KPT_R_SH][1])
+        if torso_h > 5:
+            ratio = hip_w / torso_h
+            score = max(0.0, min(1.0, (ratio - 0.15) / (0.55 - 0.15)))
+            return score, 'hip_torso_ratio'
+    
+    # Tertiary: check ear visibility asymmetry (if one ear visible but not other → sideways)
+    l_ear = _kpt_visible(kpts, KPT_L_EAR)
+    r_ear = _kpt_visible(kpts, KPT_R_EAR)
+    if l_ear != r_ear:
+        return 0.3, 'ear_asymmetry'  # One ear hidden → likely sideways
+    
+    # Default: assume mostly frontal
+    return 0.7, 'default'
+
+# ---- Color name mapping for clothing description ----
+_COLOR_NAMES = [
+    ((0, 0, 0),       'black'),
+    ((255, 255, 255), 'white'),
+    ((128, 128, 128), 'gray'),
+    ((200, 0, 0),     'red'),
+    ((0, 150, 0),     'green'),
+    ((0, 0, 200),     'blue'),
+    ((200, 200, 0),   'yellow'),
+    ((200, 100, 0),   'orange'),
+    ((150, 0, 150),   'purple'),
+    ((200, 150, 120), 'beige'),
+    ((100, 60, 30),   'brown'),
+    ((0, 200, 200),   'cyan'),
+    ((255, 180, 200), 'pink'),
+    ((0, 0, 80),      'navy'),
+]
+
+def _closest_color_name(bgr_pixel):
+    """Map a BGR pixel to the nearest named color."""
+    b, g, r = int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
+    best_name = 'unknown'
+    best_dist = float('inf')
+    for (cr, cg, cb), name in _COLOR_NAMES:
+        d = (r - cr)**2 + (g - cg)**2 + (b - cb)**2
+        if d < best_dist:
+            best_dist = d
+            best_name = name
+    return best_name
+
+def extract_clothing_colors(frame, kpts, bbox):
+    """
+    Extract dominant upper-body (shirt) and lower-body (pants) color names
+    from the person's bounding box using keypoint-guided regions.
+    Very lightweight: samples a small patch and computes the mean color.
+    Returns: (upper_color: str, lower_color: str)
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    
+    # Clamp to frame bounds
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 5 or bh < 5:
+        return 'unknown', 'unknown'
+    
+    # Use keypoints if available for more precise regions
+    has_sh = _kpt_visible(kpts, KPT_L_SH) and _kpt_visible(kpts, KPT_R_SH)
+    has_hp = _kpt_visible(kpts, KPT_L_HP) and _kpt_visible(kpts, KPT_R_HP)
+    
+    if has_sh and has_hp:
+        # Upper body: between shoulders and hips (torso/shirt region)
+        sh_y = int(min(kpts[KPT_L_SH][1], kpts[KPT_R_SH][1]))
+        hp_y = int(max(kpts[KPT_L_HP][1], kpts[KPT_R_HP][1]))
+        # Inset horizontally by 20% to avoid background
+        inset = int(bw * 0.2)
+        upper_region = frame[max(0, sh_y):min(h, hp_y), x1 + inset:x2 - inset]
+        # Lower body: from hips to bottom of bbox
+        lower_region = frame[min(h, hp_y):y2, x1 + inset:x2 - inset]
+    else:
+        # Fallback: split bbox into upper 40% and lower 40%
+        mid = y1 + bh // 2
+        top_third = y1 + bh // 3
+        bot_third = y1 + 2 * bh // 3
+        inset = int(bw * 0.2)
+        upper_region = frame[top_third:mid, x1 + inset:x2 - inset]
+        lower_region = frame[mid:bot_third, x1 + inset:x2 - inset]
+    
+    upper_color = 'unknown'
+    lower_color = 'unknown'
+    
+    if upper_region.size > 0 and upper_region.shape[0] > 2 and upper_region.shape[1] > 2:
+        mean_bgr = upper_region.mean(axis=(0, 1))
+        upper_color = _closest_color_name(mean_bgr)
+    
+    if lower_region.size > 0 and lower_region.shape[0] > 2 and lower_region.shape[1] > 2:
+        mean_bgr = lower_region.mean(axis=(0, 1))
+        lower_color = _closest_color_name(mean_bgr)
+    
+    return upper_color, lower_color
+
+def _position_label(angle_x):
+    """Convert X angle to a human-readable position label."""
+    if angle_x < -15:
+        return 'far left'
+    elif angle_x < -5:
+        return 'left'
+    elif angle_x > 15:
+        return 'far right'
+    elif angle_x > 5:
+        return 'right'
+    else:
+        return 'center'
+
+def _estimate_posture(kpts):
+    """Estimate posture from keypoints: standing, sitting, crouching, or unknown.
+    Compares vertical ratios between head, hips, and lower body.
+    Cost: ~0 (pure arithmetic on existing keypoint array)."""
+    has_nose = _kpt_visible(kpts, KPT_NOSE)
+    has_hips = _kpt_visible(kpts, KPT_L_HP) or _kpt_visible(kpts, KPT_R_HP)
+    has_knees = _kpt_visible(kpts, KPT_L_KN) or _kpt_visible(kpts, KPT_R_KN)
+    has_ankles = _kpt_visible(kpts, KPT_L_AN) or _kpt_visible(kpts, KPT_R_AN)
+    
+    if not (has_nose and has_hips):
+        return 'unknown'
+    
+    nose_y = kpts[KPT_NOSE][1]
+    hip_y = max(
+        kpts[KPT_L_HP][1] if _kpt_visible(kpts, KPT_L_HP) else 0,
+        kpts[KPT_R_HP][1] if _kpt_visible(kpts, KPT_R_HP) else 0
+    )
+    
+    if has_ankles:
+        ankle_y = max(
+            kpts[KPT_L_AN][1] if _kpt_visible(kpts, KPT_L_AN) else 0,
+            kpts[KPT_R_AN][1] if _kpt_visible(kpts, KPT_R_AN) else 0
+        )
+        total_h = ankle_y - nose_y
+        upper_h = hip_y - nose_y
+        if total_h > 20:
+            ratio = upper_h / total_h
+            # Standing: upper body is ~50-55% of total height
+            # Sitting: upper body is ~70-90% (legs folded)
+            if ratio < 0.62:
+                return 'standing'
+            elif ratio < 0.80:
+                return 'sitting'
+            else:
+                return 'crouching'
+    elif has_knees:
+        knee_y = max(
+            kpts[KPT_L_KN][1] if _kpt_visible(kpts, KPT_L_KN) else 0,
+            kpts[KPT_R_KN][1] if _kpt_visible(kpts, KPT_R_KN) else 0
+        )
+        leg_segment = knee_y - hip_y
+        upper_h = hip_y - nose_y
+        if upper_h > 10 and leg_segment > 5:
+            if leg_segment / upper_h > 0.3:
+                return 'standing'
+            else:
+                return 'sitting'
+    
+    return 'unknown'
+
+def _facing_label(frontal_score):
+    """Convert frontal_score to a readable label."""
+    if frontal_score >= 0.7:
+        return 'facing camera'
+    elif frontal_score >= 0.4:
+        return 'angled'
+    else:
+        return 'facing away'
+
+def _movement_label(current, previous):
+    """Describe movement direction from current vs previous value.
+    Returns label string. Threshold avoids noise."""
+    if previous is None:
+        return None
+    delta = current - previous
+    if abs(delta) < 0.05:  # noise threshold
+        return 'stationary'
+    return 'increasing' if delta > 0 else 'decreasing'
+
+def _relative_height_label(bbox, frame_h):
+    """Describe how much of the frame the person occupies."""
+    if frame_h <= 0:
+        return 'unknown'
+    _, y1, _, y2 = bbox
+    ratio = (y2 - y1) / frame_h
+    if ratio > 0.75:
+        return 'very close/tall'
+    elif ratio > 0.5:
+        return 'large'
+    elif ratio > 0.25:
+        return 'medium'
+    else:
+        return 'small/far'
+
+def estimate_distance_from_pose(kpts, bbox, focal_pix=FOCAL_PIX_DEFAULT):
+    """
+    Estimate distance using pose keypoints with orientation-aware multi-method fusion.
+    
+    Instead of cascading (try shoulder, fallback to torso, etc.), this computes
+    ALL available distance estimates and fuses them with weights that adapt to
+    body orientation. Vertical measurements are weighted higher when the person 
+    is sideways because they don't compress with rotation.
+    
+    kpts: np.array shape (17, 3) -> (x, y, conf)
+    bbox: (x1, y1, x2, y2)
+    Returns: (distance_meters, orientation_score, method_info) or (None, None, None)
+    """
+    if focal_pix <= 0:
+        return None, None, None
+    
+    # Step 1: Detect body orientation
+    frontal_score, orient_method = estimate_body_orientation(kpts)
+    
+    # Step 2: Collect all available distance estimates with base weights
+    estimates = []  # list of (distance, weight, method_name)
+    
+    # --- Shoulder width distance (HORIZONTAL - orientation-dependent) ---
+    if _kpt_visible(kpts, KPT_L_SH) and _kpt_visible(kpts, KPT_R_SH):
+        shoulder_width_pix = distance_between_kpts(
+            (kpts[KPT_L_SH][0], kpts[KPT_L_SH][1]),
+            (kpts[KPT_R_SH][0], kpts[KPT_R_SH][1])
+        )
+        if shoulder_width_pix > 10:
+            # Compensate for rotation: divide by cos(rotation_angle)
+            # frontal_score=1 → no compensation, frontal_score=0 → shoulder is compressed
+            # The apparent width = real_width * cos(angle)
+            # We estimate cos(angle) ≈ frontal_score (linearized)
+            # So real_width ≈ apparent_width / max(frontal_score, 0.3)
+            compensation = max(frontal_score, 0.30)  # clamp to avoid divide-by-near-zero
+            corrected_shoulder_pix = shoulder_width_pix / compensation
+            dist_shoulder = (TORSO_AVG_WIDTH_M * focal_pix) / corrected_shoulder_pix
+            
+            # Weight: high when frontal, low when sideways
+            weight = 3.0 * frontal_score  # max weight 3.0 when frontal
+            if weight > 0.3:
+                estimates.append((dist_shoulder, weight, 'shoulders'))
+    
+    # --- Torso height distance (VERTICAL - rotation-invariant) ---
+    if all(_kpt_visible(kpts, i) for i in [KPT_L_SH, KPT_R_SH, KPT_L_HP, KPT_R_HP]):
+        y_shoulders = min(kpts[KPT_L_SH][1], kpts[KPT_R_SH][1])
+        y_hips = max(kpts[KPT_L_HP][1], kpts[KPT_R_HP][1])
+        torso_height_pix = y_hips - y_shoulders
+        if torso_height_pix > 10:
+            dist_torso = (TORSO_AVG_HEIGHT_M * focal_pix) / torso_height_pix
+            # Weight: always good, even better when sideways (since horizontal is unreliable)
+            weight = 2.5 + 1.5 * (1.0 - frontal_score)  # range 2.5 (frontal) to 4.0 (sideways)
+            estimates.append((dist_torso, weight, 'torso_height'))
+    
+    # --- Head-to-shoulder distance (VERTICAL - rotation-invariant) ---
+    has_nose = _kpt_visible(kpts, KPT_NOSE)
+    has_any_shoulder = _kpt_visible(kpts, KPT_L_SH) or _kpt_visible(kpts, KPT_R_SH)
+    if has_nose and has_any_shoulder:
+        # Use the midpoint of visible shoulders
+        if _kpt_visible(kpts, KPT_L_SH) and _kpt_visible(kpts, KPT_R_SH):
+            sh_y = (kpts[KPT_L_SH][1] + kpts[KPT_R_SH][1]) / 2
+        elif _kpt_visible(kpts, KPT_L_SH):
+            sh_y = kpts[KPT_L_SH][1]
+        else:
+            sh_y = kpts[KPT_R_SH][1]
+        head_sh_pix = abs(sh_y - kpts[KPT_NOSE][1])
+        if head_sh_pix > 5:
+            dist_head = (HEAD_SHOULDER_M * focal_pix) / head_sh_pix
+            weight = 1.5  # decent auxiliary signal, always valid
+            estimates.append((dist_head, weight, 'head_shoulder'))
+    
+    # --- Hip width distance (HORIZONTAL - orientation-dependent, like shoulders) ---
+    if _kpt_visible(kpts, KPT_L_HP) and _kpt_visible(kpts, KPT_R_HP):
+        hip_width_pix = distance_between_kpts(
+            (kpts[KPT_L_HP][0], kpts[KPT_L_HP][1]),
+            (kpts[KPT_R_HP][0], kpts[KPT_R_HP][1])
+        )
+        if hip_width_pix > 8:
+            compensation = max(frontal_score, 0.30)
+            corrected_hip_pix = hip_width_pix / compensation
+            dist_hip = (0.35 * focal_pix) / corrected_hip_pix  # avg hip width ~35cm
+            weight = 1.5 * frontal_score  # only trust when frontal
+            if weight > 0.3:
+                estimates.append((dist_hip, weight, 'hip_width'))
+    
+    # --- Bounding box height (always available, rotation-invariant but noisy) ---
+    # Adapt reference height based on which body parts are actually visible
+    x1, y1, x2, y2 = bbox
+    bbox_height = y2 - y1
+    if bbox_height > 20:
+        # Determine what portion of the body the bbox covers
+        has_ankles = _kpt_visible(kpts, KPT_L_AN) or _kpt_visible(kpts, KPT_R_AN)
+        has_knees = _kpt_visible(kpts, KPT_L_KN) or _kpt_visible(kpts, KPT_R_KN)
+        has_hips = _kpt_visible(kpts, KPT_L_HP) or _kpt_visible(kpts, KPT_R_HP)
+        has_head = _kpt_visible(kpts, KPT_NOSE)
+        
+        if has_ankles and has_head:
+            ref_height = FULL_HEIGHT_M              # 1.70m — full body visible
+        elif has_knees and has_head:
+            ref_height = FULL_HEIGHT_M * 0.75       # ~1.28m — head to knees
+        elif has_hips and has_head:
+            ref_height = FULL_HEIGHT_M * 0.55       # ~0.94m — head to hips (upper body)
+        elif has_head:
+            ref_height = FULL_HEIGHT_M * 0.35       # ~0.60m — head + shoulders only
+        else:
+            ref_height = FULL_HEIGHT_M              # fallback to full height
+        
+        dist_bbox = (ref_height * focal_pix) / bbox_height
+        weight = 1.0  # lowest priority, always available
+        estimates.append((dist_bbox, weight, 'bbox_height'))
+    
+    # Step 3: Weighted fusion
+    if not estimates:
+        return None, None, None
+    
+    total_weight = sum(w for _, w, _ in estimates)
+    fused_distance = sum(d * w for d, w, _ in estimates) / total_weight
+    methods_used = '+'.join(f"{m}({w:.1f})" for _, w, m in estimates)
+    
+    return fused_distance, frontal_score, methods_used
+
+def check_torso_visibility(kpts):
+    """
+    Check if torso is visible from keypoints (enhanced version from standing1.2)
+    Returns: 'full', 'partial', or 'none'
+    """
+    torso_points = [KPT_L_SH, KPT_R_SH, KPT_L_HP, KPT_R_HP]
+    upper_body_points = [KPT_NOSE, KPT_L_EYE, KPT_R_EYE, KPT_L_EAR, KPT_R_EAR,
+                         KPT_L_SH, KPT_R_SH, KPT_L_ELB, KPT_R_ELB]
+
+    visible_torso_points = sum(1 for i in torso_points if _kpt_visible(kpts, i))
+    visible_upper_points = sum(1 for i in upper_body_points if _kpt_visible(kpts, i))
+
+    shoulders_visible = _kpt_visible(kpts, KPT_L_SH) and _kpt_visible(kpts, KPT_R_SH)
+    hips_visible = _kpt_visible(kpts, KPT_L_HP) and _kpt_visible(kpts, KPT_R_HP)
+
+    if shoulders_visible and hips_visible:
+        return 'full'
+    elif visible_torso_points >= 2 and visible_upper_points >= 5:
+        return 'partial'
+    else:
+        return 'none'
+
+# ==========================
+#  PROCESADOR VIDEO
+# ==========================
+class VideoProcessor:
+    def __init__(self, source_type="default", detection_interval=5, expire_time=MARKER_EXPIRE_TIME, roi_scale=ROI_EXPANSION_SCALE, gamma=GAMMA_CORRECTION):
+        # Configuración según el tipo de fuente
+        self.show_video_info = True
+        
+        self.source_type = source_type
+        config = SOURCE_CONFIGS.get(source_type, SOURCE_CONFIGS["default"])
+        
+        self.calibration_file = config["calibration"]
+        self.detection_interval = config["detection_interval"]
+        self.target_fps = config["target_fps"]
+
+        # Camera calibration (lazy loaded)
+        self.K = None
+        self.D = None
+        self.calibration_loaded = False
+        
+        self.manual_mode = False
+        self.manual_mode_lock = threading.Lock()
+        self.voice_enabled = True
+
+        # 3D ArUco model
+        s = ARUCO_MARKER_SIZE / 2
+        self.obj_pts = np.array([
+            [-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]
+        ], dtype=np.float32)
+
+        # Gamma correction (cached)
+        self.gamma = gamma
+        self._gamma_table_cache = None
+
+        # YOLO model (lazy loaded on first frame)
+        self.yolo = None
+        self.object_classes = None
+        self.use_yolo_tracking = True  # Use built-in tracking instead of MOSSE
+        
+        # Pose model for distance estimation (lazy loaded)
+        self.pose_model = None
+        self.pose_device = None  # Track which device pose model is on ('cuda' or 'cpu')
+        self.use_pose_distance = getattr(getattr(Config, 'AI', None), 'USE_POSE_DISTANCE', True)
+        self.use_aruco = getattr(getattr(Config, 'AI', None), 'USE_ARUCO_MARKERS', False)
+        
+        # Face recognition (ArcFace via ONNX Runtime)
+        self.face_system = None    # LiveFaceRecognition instance
+        self.face_recognition_enabled = False
+        self.pending_enrollment = None  # {'person_id': str, 'name': str, 'ts': float}
+        self._raw_frame = None          # Latest un-annotated frame for enrollment
+        
+        # Get focal length from calibration file
+        # Store BOTH the calibration focal length and the resolution it was calibrated at
+        self._cal_focal = None
+        self._cal_width = None
+        ai_config = getattr(Config, 'AI', None)
+        if ai_config and hasattr(ai_config, 'get_focal_length'):
+            focal = ai_config.get_focal_length()
+            if focal is not None:
+                self._cal_focal = focal
+                # Also read the calibration resolution to enable proper scaling
+                try:
+                    config_dir = os.path.dirname(os.path.abspath(__file__))
+                    cal_path = os.path.join(config_dir, 'calibration', 'calINSPIRO.npz')
+                    cal_data = np.load(cal_path)
+                    self._cal_width = int(cal_data.get('width', 1280))
+                except Exception:
+                    self._cal_width = 1280  # default calibration resolution
+                self.focal_length_pix = focal
+                print(f"[INFO] Loaded focal length from calibration: {self.focal_length_pix:.2f}px (cal res: {self._cal_width}px wide)")
+            else:
+                self.focal_length_pix = FOCAL_PIX_DEFAULT
+                print(f"[INFO] Calibration not found, using default: {FOCAL_PIX_DEFAULT}px (will auto-estimate from frame)")
+        else:
+            self.focal_length_pix = FOCAL_PIX_DEFAULT
+            print(f"[WARNING] Using default focal length: {FOCAL_PIX_DEFAULT} pixels")
+
+        # ArUco detector
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        params = cv2.aruco.DetectorParameters()
+        params.minMarkerPerimeterRate = 0.02
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshConstant = 7
+        params.polygonalApproxAccuracyRate = 0.05
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
+
+        # Parameters
+        self.roi_scale = roi_scale
+        self.expire_time = expire_time
+
+        # Calibration data
+        self.frame_width = None
+        self.frame_height = None
+        self.fov_x = None
+        self.fov_y = None
+
+        # State
+        self.guided_mode = False
+        self.selected_id = None
+        self.stop_event = threading.Event()  # Critical: control de threads
+
+        # Data structures
+        self.trackers = {}
+        self.rois = {}
+        self.history = OrderedDict()
+        self.smooth = {}
+        self.object_detections = {}
+        self.pose_detections = []
+        
+        # For pose-based detection
+        self.processed_frame = None
+        self.lock = threading.Lock()
+        
+        # Face recognition results (person_id -> (name, confidence))
+        self.face_identities = {}
+        
+        # GUI
+        self.console = ConsoleBuffer()       # System log (fast updates, detection info)
+        self.cmd_console = ConsoleBuffer()   # Command console (user commands & responses)
+        self.input_text = ""
+        self.show_gui = True
+        self.layout = {
+            'video_width': 0.7,
+            'console_width': 0.3,
+            'input_height': 40
+        }
+        self.last_print_time = 0
+        self._frame_gen = 0  # incremented each time processed_frame is updated
+        
+    def _get_gamma_table(self):
+        """Lazy load and cache gamma correction table"""
+        if self._gamma_table_cache is None:
+            invG = 1.0 / self.gamma
+            self._gamma_table_cache = np.array([(i/255.0)**invG * 255 for i in range(256)], dtype=np.uint8)
+        return self._gamma_table_cache
+
+    def undistort(self, frame):
+        return cv2.undistort(frame, self.K, self.D, None, self.K)
+
+    def _prune_expired(self):
+        """Remove expired markers and clean up resources"""
+        now = time.time()
+        expired = []
+        for mid, d in list(self.history.items()):
+            if now - d['last_seen'] > self.expire_time:
+                expired.append(mid)
+        
+        if expired:
+            with self.lock:
+                for mid in expired:
+                    # Clean up tracker
+                    tracker = self.trackers.pop(mid, None)
+                    if tracker:
+                        del tracker  # Explicitly delete
+                    
+                    self.rois.pop(mid, None)
+                    self.object_detections.pop(mid, None)
+                    self.smooth.pop(mid, None)
+                    self.history.pop(mid, None)
+
+    def validate_corners(self, pts):
+        lengths = [np.linalg.norm(pts[(i+1)%4] - pts[i]) for i in range(4)]
+        if min(lengths) <= 0:
+            return False
+        area = cv2.contourArea(pts)
+        tol = 0.2 if area > 50000 else 0.4
+        return (max(lengths)/min(lengths)) < (1 + tol)
+
+    def _expand_roi(self, cx, cy, w, h, fh, fw):
+        ew, eh = w*self.roi_scale, h*self.roi_scale
+        x0 = max(0, int(cx - ew/2))
+        y0 = max(0, int(cy - eh/2))
+        x1 = min(fw, int(cx + ew/2))
+        y1 = min(fh, int(cy + eh/2))
+        return (x0, y0, x1-x0, y1-y0)
+
+    def _get_active_markers(self):
+        now = time.time()
+        return [mid for mid, d in self.history.items() if now - d['last_seen'] <= self.expire_time]
+
+    def _print_detection_info(self):
+        now = time.time()
+            
+        output_lines = []
+        with self.lock:
+            output_lines.append("\n" + "="*50)
+            output_lines.append("HISTORIAL DE MARCADORES:")
+            
+            if not self.history:
+                output_lines.append("No hay marcadores en el historial")
+            else:
+                for mid, d in self.history.items():
+                    status = "ACTIVO" if mid in self._get_active_markers() else "INACTIVO"
+                    line = f"\nID {mid} [{status}] | Última distancia: {d['distance']:.2f}m \n Ángulo X: {d['angle_x']:+.1f}° | Ángulo Y: {d['angle_y']:+.1f}°"
+                    objs = self.object_detections.get(mid, [])
+                    if objs:
+                        line += "\n   Objetos detectados:"
+                        for obj in objs:
+                            cls_name = self.object_classes[obj['class_id']]
+                            line += f"\n   - {cls_name} (confianza: {obj['confidence']:.2f})"
+                    output_lines.append(line)
+            output_lines.append("="*50 + "\n")
+        
+        self.console.add_output('\n'.join(output_lines))
+        self.last_print_time = now
+
+    def process_frame(self, frame):
+        self.frame_idx = getattr(self, 'frame_idx', 0) + 1
+        
+        # Auto-detect frame dimensions from actual camera frame
+        h, w = frame.shape[:2]
+        if self.frame_width is None or self.frame_height is None or self.frame_width != w or self.frame_height != h:
+            self.frame_width = w
+            self.frame_height = h
+            # Recompute FOV with updated dimensions
+            if self.K is not None:
+                fx, fy = self.K[0,0], self.K[1,1]
+                self.fov_x, self.fov_y = compute_fov(fx, fy, w, h)
+            elif self.fov_x is None or self.fov_y is None:
+                self.fov_x = 60.0
+                self.fov_y = 45.0
+            # Scale focal length to match actual frame resolution
+            if self._cal_focal is not None and self._cal_width is not None and self._cal_width != w:
+                # Calibration was at a different resolution — scale proportionally
+                scale = w / self._cal_width
+                self.focal_length_pix = self._cal_focal * scale
+                print(f"[INFO] Scaled focal length: {self._cal_focal:.1f}px (cal@{self._cal_width}px) → {self.focal_length_pix:.1f}px (frame@{w}px)")
+            elif self.focal_length_pix == FOCAL_PIX_DEFAULT:
+                # No calibration available — approximate from resolution (typical webcam ~65° HFOV)
+                self.focal_length_pix = w / (2 * np.tan(np.radians(32.5)))  # ~65° HFOV
+                print(f"[INFO] Auto-estimated focal length: {self.focal_length_pix:.1f}px for {w}x{h}")
+            if self.frame_idx == 1:
+                print(f"[INFO] Frame dimensions: {w}x{h}, FOV: {self.fov_x:.1f}°x{self.fov_y:.1f}°")
+        
+        # Early return if no calibration (only needed for ArUco)
+        if self.use_aruco and (self.K is None or self.D is None):
+            return
+        
+        # Undistort and enhance (only if using ArUco)
+        if self.use_aruco and self.K is not None:
+            und = self.undistort(frame)
+            lut = cv2.LUT(und, self._get_gamma_table())
+        else:
+            lut = frame  # Use raw frame for pose (faster)
+
+        # Optional: ArUco detection (legacy mode)
+        if self.use_aruco:
+            # Reutilizar gray buffer si existe
+            if not hasattr(self, '_gray_buffer') or self._gray_buffer.shape[:2] != lut.shape[:2]:
+                self._gray_buffer = np.empty(lut.shape[:2], dtype=np.uint8)
+            cv2.cvtColor(lut, cv2.COLOR_BGR2GRAY, dst=self._gray_buffer)
+            corners, ids, _ = self.detector.detectMarkers(self._gray_buffer)
+        else:
+            corners, ids = None, None
+
+        seen = set()
+        if self.use_aruco and ids is not None:
+            self._prune_expired()
+            fh, fw = frame.shape[:2]
+
+            for idx, mid in enumerate(ids.flatten()):
+                pts = corners[idx][0].astype(np.float32)
+                if not self.validate_corners(pts): continue
+
+                cx = float(pts[:,0].mean())
+                cy = float(pts[:,1].mean())
+
+                # Use Numba-optimized angle calculation
+                ax, ay = calculate_angles_fast(cx, cy, float(self.frame_width), 
+                                              float(self.frame_height), self.fov_x, self.fov_y)
+
+                _, rvec, tvec = cv2.solvePnP(self.obj_pts, pts.astype(np.float32), self.K, self.D)
+                # Use Numba-optimized distance calculation
+                d = calculate_distance_fast(tvec.flatten()) * DIST_CORRECTION
+
+                seen.add(mid)
+                buf = self.smooth.setdefault(mid, {
+                    'd': deque(maxlen=SMOOTH_WINDOW_SIZE),
+                    'ax': deque(maxlen=SMOOTH_WINDOW_SIZE),
+                    'ay': deque(maxlen=SMOOTH_WINDOW_SIZE)
+                })
+                buf['d'].append(d)
+                buf['ax'].append(ax)
+                buf['ay'].append(ay)
+                d_med = float(sorted(buf['d'])[len(buf['d']) // 2])
+                ax_med = float(sorted(buf['ax'])[len(buf['ax']) // 2])
+                ay_med = float(sorted(buf['ay'])[len(buf['ay']) // 2])
+
+                old = self.history.get(mid,{})
+                with self.lock:
+                    self.history[mid] = {
+                        'corners': pts.astype(int),
+                        'distance': d_med,
+                        'angle_x': ax_med,
+                        'angle_y': ay_med,
+                        'prev_distance': old.get('distance'),
+                        'prev_angle_x': old.get('angle_x'),
+                        'prev_angle_y': old.get('angle_y'),
+                        'last_seen': time.time(),
+                        'draw_box': True,
+                        'last_detection_time': time.time()
+                    }
+
+                lengths = [np.linalg.norm(pts[(j+1)%4]-pts[j]) for j in range(4)]
+                w_px = float(np.mean(lengths))
+                roi = self._expand_roi(cx, cy, w_px, w_px, fh, fw)
+                tr = cv2.legacy.TrackerMOSSE_create()
+                if tr.init(frame, roi):
+                    self.trackers[mid] = tr
+                    self.rois[mid] = roi
+
+        # Tracking (only for ArUco markers)
+        if self.use_aruco:
+            for mid, tr in list(self.trackers.items()):
+                if mid in seen: continue
+                ok, bbox = tr.update(frame)
+                if not ok:
+                    with self.lock:
+                        self.trackers.pop(mid, None)
+                        self.rois.pop(mid, None)
+                    continue
+                x,y,w_,h_ = map(int, bbox)
+                quad = np.array([[x,y],[x+w_,y],[x+w_,y+h_],[x,y+h_]], np.int32)
+                with self.lock:
+                    if mid in self.history:
+                        self.history[mid].update({
+                            'corners': quad,
+                            'last_seen': time.time(),
+                            'draw_box': False
+                        })
+        
+        # PRIMARY: Pose-based detection (main navigation method)
+        if self.use_pose_distance:
+            self._detect_with_pose(frame)
+        
+        # Object detection for active targets (works with both ArUco and pose)
+        active = self._get_active_markers()
+        if active and self.use_aruco:
+            self._detect_objects(frame, active)
+        else:
+            with self.lock:
+                self.object_detections.clear()
+
+        # Throttled detection info (only rebuild string when needed — every 1s)
+        now = time.time()
+        if now - self.last_print_time >= 1.0 and not self.guided_mode:
+            self._print_detection_info()
+        self._render_output(frame)
+
+    def _detect_objects(self, frame, active):
+        # Lazy load YOLO on first detection
+        if self.yolo is None:
+            print("🔍 Cargando modelo YOLO (primera vez)...")
+            model_path = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            self.yolo = YOLO(model_path)
+            self.object_classes = self.yolo.names
+            print("✅ Modelo YOLO listo (YOLOv11 con ByteTrack)")
+        
+        DET_RAD = 2.0
+        # Use YOLO tracking with ByteTrack (built-in, more reliable than MOSSE)
+        try:
+            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=0, persist=True)
+        except:
+            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device='cpu', persist=True)     
+
+        dets = {}
+        with self.lock:
+            data_map = {m:self.history[m] for m in active}
+
+        for mid, d in data_map.items():
+            mpos = np.mean(d['corners'], axis=0)
+            size = np.linalg.norm(d['corners'][0]-d['corners'][1])
+            radius = size*DET_RAD
+            found = []
+            for r in results:
+                for box in r.boxes:
+                    x1,y1,x2,y2 = map(int, box.xyxy[0])
+                    pos = np.array([(x1+x2)/2, (y1+y2)/2])
+                    if np.linalg.norm(pos-mpos) < radius:
+                        obj = {
+                            'class_id': int(box.cls),
+                            'confidence': float(box.conf),
+                            'bbox': (x1,y1,x2,y2)
+                        }
+                        # Add tracking ID if available (ByteTrack)
+                        if box.id is not None:
+                            obj['track_id'] = int(box.id)
+                        found.append(obj)
+            dets[mid] = found
+
+        with self.lock:
+            self.object_detections = dets
+    
+    def _detect_with_pose(self, frame, active=None):
+        """
+        PRIMARY detection using pose estimation for distance.
+        Uses ByteTrack for persistent person IDs across frames and
+        orientation-aware multi-method distance fusion with temporal smoothing.
+        """
+        # Lazy load pose model
+        if self.pose_model is None:
+            print("🧍 Cargando modelo de pose (primera vez)...")
+            try:
+                self.pose_model = YOLO('yolov8s-pose.pt')
+                self.pose_model.to('cuda')
+                self.pose_device = 'cuda'
+                print("✅ Modelo de pose listo - MODO PRINCIPAL (GPU: ON, ByteTrack tracking)")
+            except Exception as e:
+                print(f"\n⚠️ GPU loading failed: {e}")
+                
+                if "Torch not compiled with CUDA enabled" in str(e):
+                    print("\n🛑 DIAGNÓSTICO: Tu PyTorch no tiene soporte GPU instalada.")
+                    print("   Ejecuta: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall")
+                    
+                import torch
+                print(f"   Debug Info:")
+                print(f"   - Torch Version: {torch.__version__}")
+                print(f"   - CUDA Available: {torch.cuda.is_available()}")
+                if torch.cuda.is_available():
+                     print(f"   - GPU Device: {torch.cuda.get_device_name(0)}")
+                
+                print("\n⚠️  Cambiando a modo CPU (Lento)...")
+                try:
+                    self.pose_model = YOLO('yolov8s-pose.pt')
+                    self.pose_model.to('cpu')
+                    self.pose_device = 'cpu'
+                    print("✅ Modelo de pose listo (CPU mode, ByteTrack tracking)")
+                except Exception as e2:
+                    print(f"❌ Falló también en CPU: {e2}")
+                    self.use_pose_distance = False
+                    return
+        
+        try:
+            # Use .track() instead of __call__() for persistent ByteTrack IDs
+            inf_device = 0 if self.pose_device == 'cuda' else 'cpu'
+            use_half = (self.pose_device == 'cuda')  # FP16 on GPU = ~2x faster
+            results = self.pose_model.track(
+                frame, conf=0.25, verbose=False, device=inf_device,
+                persist=True, imgsz=640, half=use_half
+            )
+        except Exception as e:
+            if not hasattr(self, '_pose_error_count'):
+                self._pose_error_count = 0
+            self._pose_error_count += 1
+            if self._pose_error_count <= 3:
+                print(f"[ERROR] Pose inference failed (#{self._pose_error_count}): {e}")
+                if self.pose_device == 'cuda':
+                    print("[WARN] Switching pose model to CPU after GPU failure...")
+                    try:
+                        self.pose_model.to('cpu')
+                        self.pose_device = 'cpu'
+                        print("[INFO] Switched to CPU successfully. Will retry next frame.")
+                    except Exception as e2:
+                        print(f"[ERROR] CPU switch also failed: {e2}")
+            return
+        
+        res = results[0]
+        if res.boxes is None or res.keypoints is None:
+            return
+        
+        # Batch GPU→CPU transfer (single sync point instead of 3-4 separate ones)
+        _boxes_t = res.boxes.xyxy
+        _kpts_xy_t = res.keypoints.xy
+        _kpts_conf_t = res.keypoints.conf
+        _track_ids_t = res.boxes.id
+        # Move all to CPU in one batch
+        boxes = _boxes_t.cpu().numpy()
+        kpts_xy = _kpts_xy_t.cpu().numpy()
+        kpts_conf = _kpts_conf_t.cpu().numpy() if _kpts_conf_t is not None else np.ones(kpts_xy.shape[:2])
+        track_ids = _track_ids_t.cpu().numpy().astype(int) if _track_ids_t is not None else None
+        
+        # Build full keypoints array once (xy + conf) instead of per-person concatenate
+        all_kpts = np.concatenate([kpts_xy, kpts_conf.reshape(kpts_conf.shape[0], -1, 1)], axis=2)
+        
+        # Keep a raw (un-annotated) frame copy for face enrollment
+        self._raw_frame = frame.copy()
+        
+        seen_persons = set()
+        
+        for i in range(boxes.shape[0]):
+            box = boxes[i]
+            kpts = all_kpts[i]
+            
+            # Determine persistent person ID from ByteTrack, or fall back to index
+            if track_ids is not None and i < len(track_ids):
+                person_id = f"person_{track_ids[i]}"
+            else:
+                person_id = f"person_{i+1}"
+            
+            # Estimate distance with orientation-aware fusion
+            result = estimate_distance_from_pose(kpts, box, self.focal_length_pix)
+            distance, frontal_score, method_info = result
+            
+            if distance is None:
+                # Final fallback: bbox height with visibility-aware reference
+                x1b, y1b, x2b, y2b = box
+                bbox_h = y2b - y1b
+                if bbox_h > 10:
+                    has_ankles = _kpt_visible(kpts, KPT_L_AN) or _kpt_visible(kpts, KPT_R_AN)
+                    has_knees = _kpt_visible(kpts, KPT_L_KN) or _kpt_visible(kpts, KPT_R_KN)
+                    has_hips = _kpt_visible(kpts, KPT_L_HP) or _kpt_visible(kpts, KPT_R_HP)
+                    has_head = _kpt_visible(kpts, KPT_NOSE)
+                    if has_ankles and has_head:
+                        ref = FULL_HEIGHT_M
+                    elif has_knees and has_head:
+                        ref = FULL_HEIGHT_M * 0.75
+                    elif has_hips and has_head:
+                        ref = FULL_HEIGHT_M * 0.55
+                    elif has_head:
+                        ref = FULL_HEIGHT_M * 0.35
+                    else:
+                        ref = FULL_HEIGHT_M
+                    distance = (ref * self.focal_length_pix) / bbox_h
+                    frontal_score = 0.5
+                    method_info = 'bbox_fallback'
+
+            # Apply distance correction factor
+            if distance is not None:
+                distance = distance * DIST_CORRECTION
+            
+            torso_state = check_torso_visibility(kpts)
+            
+            if distance is not None:
+                x1, y1, x2, y2 = box.astype(int)
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                angle_x, angle_y = calculate_angles_fast(
+                    float(cx), float(cy), 
+                    float(self.frame_width), float(self.frame_height),
+                    self.fov_x, self.fov_y
+                )
+                
+                seen_persons.add(person_id)
+                
+                # --- Temporal smoothing (same as ArUco markers) ---
+                buf = self.smooth.setdefault(person_id, {
+                    'd': deque(maxlen=SMOOTH_WINDOW_SIZE),
+                    'ax': deque(maxlen=SMOOTH_WINDOW_SIZE),
+                    'ay': deque(maxlen=SMOOTH_WINDOW_SIZE)
+                })
+                buf['d'].append(distance)
+                buf['ax'].append(angle_x)
+                buf['ay'].append(angle_y)
+                # Fast median for small deques (sorted middle — avoids np.median array overhead)
+                d_smooth = float(sorted(buf['d'])[len(buf['d']) // 2])
+                ax_smooth = float(sorted(buf['ax'])[len(buf['ax']) // 2])
+                ay_smooth = float(sorted(buf['ay'])[len(buf['ay']) // 2])
+                
+                # Store in history (navigation compatibility)
+                old = self.history.get(person_id, {})
+                corners = np.array([
+                    [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+                ], dtype=np.int32)
+                
+                # Extract clothing colors (lightweight — ~0.1ms per person)
+                try:
+                    upper_color, lower_color = extract_clothing_colors(frame, kpts, (x1, y1, x2, y2))
+                except Exception:
+                    upper_color, lower_color = 'unknown', 'unknown'
+                
+                with self.lock:
+                    self.history[person_id] = {
+                        'corners': corners,
+                        'distance': d_smooth,
+                        'angle_x': ax_smooth,
+                        'angle_y': ay_smooth,
+                        'prev_distance': old.get('distance'),
+                        'prev_angle_x': old.get('angle_x'),
+                        'prev_angle_y': old.get('angle_y'),
+                        'last_seen': time.time(),
+                        'draw_box': True,
+                        'last_detection_time': time.time(),
+                        'type': 'person',
+                        'torso_state': torso_state,
+                        'keypoints': kpts,
+                        'bbox': (x1, y1, x2, y2),
+                        'frontal_score': frontal_score,
+                        'distance_method': method_info,
+                        'distance_raw': distance,
+                        'upper_color': upper_color,
+                        'lower_color': lower_color,
+                        'position_label': _position_label(ax_smooth),
+                    }
+        
+        # Remove old person detections that are no longer visible
+        with self.lock:
+            for pid in list(self.history.keys()):
+                if pid.startswith('person_') and pid not in seen_persons:
+                    if time.time() - self.history[pid].get('last_seen', 0) > self.expire_time:
+                        del self.history[pid]
+                        self.face_identities.pop(pid, None)
+                        self.smooth.pop(pid, None)  # Clean up smoothing buffer too
+        
+        # Face recognition on detected persons (uses keypoints — zero extra detection cost)
+        if self.face_recognition_enabled and self.face_system:
+            self._recognize_faces(frame, seen_persons)
+    
+    def _recognize_faces(self, frame, person_ids):
+        """Recognise faces using pose keypoints + ArcFace embeddings."""
+        for person_id in person_ids:
+            data = self.history.get(person_id)
+            if not data:
+                continue
+            kpts = data.get('keypoints')
+            if kpts is None:
+                continue
+            try:
+                name, sim = self.face_system.recognize_person(frame, kpts, person_id)
+                if name:
+                    with self.lock:
+                        self.face_identities[person_id] = (name, sim)
+            except Exception:
+                pass  # don't let face rec crash detection
+
+    def _render_output(self, frame):
+        # Draw directly on the frame — no copy needed (saves ~2ms memcpy per frame)
+        out = frame
+        h, w = out.shape[:2]
+        LT = cv2.LINE_8  # Fast aliased lines (LINE_AA is ~3x slower)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        # --- Crosshair ---
+        cx_f, cy_f = w >> 1, h >> 1
+        cv2.line(out, (cx_f - 20, cy_f), (cx_f + 20, cy_f), (100, 100, 255), 1, LT)
+        cv2.line(out, (cx_f, cy_f - 20), (cx_f, cy_f + 20), (100, 100, 255), 1, LT)
+        
+        active = self._get_active_markers()
+        
+        # --- Compact HUD overlay (no blending — opaque dark rect) ---
+        if self.show_video_info and active:
+            ty = 22
+            cv2.rectangle(out, (4, 4), (280, 8 + len(active) * 18 + 14), (15, 15, 15), -1)
+            cv2.putText(out, "TRACKING", (10, ty), font, 0.45, (0, 200, 255), 1, LT)
+            ty += 18
+            for mid in active:
+                d = self.history[mid]
+                is_person = isinstance(mid, str) and mid.startswith('person_')
+                if is_person:
+                    pnum = mid.split('_')[1]
+                    cv2.putText(out, f"P{pnum} {d['distance']:.1f}m X:{d['angle_x']:+.0f} Y:{d['angle_y']:+.0f}", (10, ty), font, 0.40, (200, 200, 200), 1, LT)
+                else:
+                    cv2.putText(out, f"ID{mid} {d['distance']:.1f}m", (10, ty), font, 0.40, (200, 200, 200), 1, LT)
+                ty += 18
+
+        # --- Skeleton connections (cached once) ---
+        if not hasattr(self, '_skeleton_connections'):
+            self._skeleton_connections = [
+                (KPT_L_SH, KPT_R_SH), (KPT_L_HP, KPT_R_HP),
+                (KPT_L_SH, KPT_L_HP), (KPT_R_SH, KPT_R_HP),
+                (KPT_L_SH, KPT_L_ELB), (KPT_L_ELB, KPT_L_WRI),
+                (KPT_R_SH, KPT_R_ELB), (KPT_R_ELB, KPT_R_WRI),
+                (KPT_L_HP, KPT_L_KN), (KPT_L_KN, KPT_L_AN),
+                (KPT_R_HP, KPT_R_KN), (KPT_R_KN, KPT_R_AN),
+                (KPT_NOSE, KPT_L_EYE), (KPT_NOSE, KPT_R_EYE),
+                (KPT_L_EYE, KPT_L_EAR), (KPT_R_EYE, KPT_R_EAR),
+            ]
+
+        # --- Render each detection ---
+        for mid in active:
+            d = self.history[mid]
+            is_person = isinstance(mid, str) and mid.startswith('person_')
+            
+            if is_person:
+                x1, y1, x2, y2 = d.get('bbox', (0, 0, 0, 0))
+                distance = d.get('distance', 0)
+                
+                # Color by distance
+                if distance < 1.0:
+                    accent = (0, 140, 255)
+                elif distance < 2.5:
+                    accent = (255, 200, 0)
+                else:
+                    accent = (255, 120, 50)
+                
+                if d.get('torso_state') == 'none':
+                    accent = (accent[0] >> 1, accent[1] >> 1, accent[2] >> 1)
+                
+                # Simple rectangle (1 call vs 8 corner lines)
+                cv2.rectangle(out, (x1, y1), (x2, y2), accent, 2, LT)
+                
+                # Label above bbox (opaque background, no blending)
+                person_num = mid.split('_')[1]
+                label = f"P{person_num}"
+                if mid in self.face_identities:
+                    name, confidence = self.face_identities[mid]
+                    label = f"{name} {confidence:.0%}"
+                    accent = (255, 0, 220)
+                
+                full_label = f"{label} {distance:.1f}m"
+                ly = max(12, y1 - 6)
+                cv2.rectangle(out, (x1, ly - 14), (x1 + len(full_label) * 9 + 8, ly + 2), accent, -1)
+                cv2.putText(out, full_label, (x1 + 4, ly), font, 0.45, (255, 255, 255), 1, LT)
+                
+                # Skeleton — single thin line per connection, no glow
+                if 'keypoints' in d:
+                    kpts = d['keypoints']
+                    pts_cache = {}
+                    for idx in range(min(17, len(kpts))):
+                        if kpts[idx][2] > CONF_MIN_KPT:
+                            pts_cache[idx] = (int(kpts[idx][0]), int(kpts[idx][1]))
+                    
+                    for a, b in self._skeleton_connections:
+                        if a in pts_cache and b in pts_cache:
+                            cv2.line(out, pts_cache[a], pts_cache[b], accent, 1, LT)
+                    
+                    # Single small dot per keypoint
+                    for pt in pts_cache.values():
+                        cv2.circle(out, pt, 2, accent, -1, LT)
+            else:
+                # ArUco marker
+                if d['draw_box']:
+                    cv2.polylines(out, [d['corners']], True, (0, 255, 120), 2, LT)
+                    cv2.putText(out, f'ID:{mid}', tuple(d['corners'][0]), font, 0.6, (0, 255, 120), 1, LT)
+            
+            # Object detections
+            if mid in self.object_detections:
+                for obj in self.object_detections[mid]:
+                    ox1, oy1, ox2, oy2 = obj['bbox']
+                    cv2.rectangle(out, (ox1, oy1), (ox2, oy2), (255, 80, 80), 1, LT)
+                    if self.show_video_info:
+                        lbl = f"{self.object_classes[obj['class_id']]} {obj['confidence']:.0%}"
+                        cv2.putText(out, lbl, (ox1, oy1 - 6), font, 0.40, (255, 80, 80), 1, LT)
+
+        self.processed_frame = out
+        self._frame_gen += 1
+
+    def _render_gui(self, frame):
+        if not self.show_gui:
+            return frame
+
+        LT = cv2.LINE_8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Pre-allocate all arrays once (1280x720 for speed — was 1920x1080)
+        if not hasattr(self, '_gui_buffers'):
+            total_w = 1280
+            total_h = 720
+            console_w = int(total_w * self.layout['console_width'])
+            video_w = total_w - console_w
+            status_h = 28
+            input_h = min(self.layout['input_height'], 32)
+            video_h = total_h - input_h - status_h
+            
+            self._gui_buffers = {
+                'canvas': np.zeros((total_h, total_w, 3), dtype=np.uint8),
+            }
+            self._gui_dims = {
+                'total_w': total_w, 'total_h': total_h,
+                'console_w': console_w, 'video_w': video_w,
+                'input_h': input_h, 'video_h': video_h,
+                'status_h': status_h,
+            }
+        
+        dims = self._gui_dims
+        total_w = dims['total_w']
+        console_w = dims['console_w']
+        video_w = dims['video_w']
+        input_h = dims['input_h']
+        video_h = dims['video_h']
+        status_h = dims['status_h']
+        canvas = self._gui_buffers['canvas']
+
+        # Resize frame maintaining aspect ratio
+        h, w = frame.shape[:2]
+        cache_key = (h, w)
+        if not hasattr(self, '_resize_cache') or self._resize_cache['key'] != cache_key:
+            aspect_ratio = w / h
+            if aspect_ratio > video_w / video_h:
+                new_w = video_w
+                new_h = int(new_w / aspect_ratio)
+            else:
+                new_h = video_h
+                new_w = int(new_h * aspect_ratio)
+            x_offset = (video_w - new_w) // 2
+            y_offset = (video_h - new_h) // 2
+            self._resize_cache = {
+                'key': cache_key,
+                'new_w': new_w, 'new_h': new_h,
+                'x_offset': x_offset, 'y_offset': y_offset
+            }
+        
+        cache = self._resize_cache
+        resized_frame = cv2.resize(frame, (cache['new_w'], cache['new_h']), interpolation=cv2.INTER_LINEAR)
+
+        # Video area — fill dark then place frame
+        vy1 = status_h
+        vy2 = status_h + video_h
+        canvas[vy1:vy2, 0:video_w] = (18, 18, 22)
+        fy1 = vy1 + cache['y_offset']
+        fx1 = cache['x_offset']
+        canvas[fy1:fy1 + cache['new_h'], fx1:fx1 + cache['new_w']] = resized_frame
+
+        # Console area — split into system log (top 1/4) and command console (bottom 3/4)
+        cx1 = video_w
+        console_h = vy2 - vy1
+        syslog_h = console_h // 4
+        cmdcon_h = console_h - syslog_h
+        
+        syslog_y1 = vy1
+        syslog_y2 = vy1 + syslog_h
+        cmdcon_y1 = syslog_y2
+        cmdcon_y2 = vy2
+        
+        self._draw_system_log(canvas[syslog_y1:syslog_y2, cx1:total_w])
+        self._draw_cmd_console(canvas[cmdcon_y1:cmdcon_y2, cx1:total_w])
+
+        # Input bar — draw directly on canvas
+        iy1 = vy2
+        iy2 = iy1 + input_h
+        self._draw_input(canvas[iy1:iy2, :])
+
+        # Status bar — draw directly on canvas
+        self._draw_status_bar(canvas[0:status_h, :])
+
+        return canvas
+
+    def _draw_status_bar(self, area):
+        """Flat dark status bar — no gradient."""
+        h, w = area.shape[:2]
+        area[:] = (30, 30, 35)
+        LT = cv2.LINE_8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        cv2.putText(area, "SIGO", (8, h - 7), font, 0.50, (0, 200, 255), 1, LT)
+        
+        # Center: Mode indicator
+        if self.guided_mode:
+            mode_text, mode_color = "NAVIGATING", (0, 255, 120)
+        elif hasattr(self, 'manual_mode') and self.manual_mode:
+            mode_text, mode_color = "MANUAL", (0, 180, 255)
+        else:
+            mode_text, mode_color = "STANDBY", (100, 100, 110)
+        mx = (w - len(mode_text) * 10) // 2
+        cv2.putText(area, mode_text, (mx, h - 7), font, 0.50, mode_color, 1, LT)
+        
+        # Right: targets + device
+        active = self._get_active_markers()
+        n_persons = sum(1 for m in active if isinstance(m, str) and m.startswith('person_'))
+        device_str = 'GPU' if getattr(self, 'pose_device', '') == 'cuda' else 'CPU'
+        right_text = f"{n_persons}T | {device_str}"
+        cv2.putText(area, right_text, (w - len(right_text) * 8 - 8, h - 7), font, 0.40, (180, 180, 190), 1, LT)
+
+    def _draw_system_log(self, area):
+        """Top panel: fast-scrolling system log (detection info, nav telemetry, debug)"""
+        h, w = area.shape[:2]
+        area[:] = (20, 20, 24)
+        LT = cv2.LINE_8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        # Header
+        cv2.putText(area, "SYSTEM LOG", (6, 14), font, 0.34, (80, 80, 90), 1, LT)
+        
+        # Separator line at bottom
+        cv2.line(area, (0, h - 1), (w, h - 1), (50, 50, 60), 1)
+        
+        # Compute layout params
+        lh = max(10, int(12 * (h / 180)))
+        font_scale = max(0.24, 0.30 * (h / 180))
+        max_lines = max(1, (h - 20) // max(1, lh))
+        
+        visible_lines = self.console.get_visible_buffer()[-max_lines:]
+        
+        y = 18 + lh
+        for line in visible_lines:
+            cv2.putText(area, line[:80], (6, y), font, font_scale, (110, 110, 118), 1, LT)
+            y += lh
+
+    def _draw_cmd_console(self, area):
+        """Bottom panel: clean command console (user commands & responses only)"""
+        h, w = area.shape[:2]
+        area[:] = (25, 25, 30)
+        LT = cv2.LINE_8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        # Header
+        cv2.putText(area, "CONSOLE", (6, 16), font, 0.38, (0, 200, 255), 1, LT)
+        
+        # Compute font params once
+        if not hasattr(self, '_cmdcon_params'):
+            scale_factor = h / 540
+            lh = max(12, int(16 * scale_factor))
+            self._cmdcon_params = {
+                'font_scale': max(0.28, 0.35 * scale_factor),
+                'line_height': lh,
+                'max_lines': (h - 24) // max(1, lh)
+            }
+        
+        params = self._cmdcon_params
+        visible_lines = self.cmd_console.get_visible_buffer()[-params['max_lines']:]
+        
+        y = 24 + params['line_height']
+        for line in visible_lines:
+            # Color code: user commands cyan, responses white
+            if line.startswith("> "):
+                color = (0, 200, 255)
+            elif line.startswith("✅") or line.startswith("🎯"):
+                color = (0, 230, 130)
+            elif line.startswith("❌") or line.startswith("⚠️"):
+                color = (80, 80, 255)
+            else:
+                color = (200, 200, 210)
+            cv2.putText(area, line[:80], (6, y), font, params['font_scale'], color, 1, LT)
+            y += params['line_height']
+
+    def _draw_input(self, area):
+        h, w = area.shape[:2]
+        area[:] = (20, 20, 25)
+        LT = cv2.LINE_8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        y_pos = max(10, int(h * 0.65))
+        cv2.putText(area, ">", (6, y_pos), font, 0.45, (0, 200, 255), 1, LT)
+        
+        input_str = self.cmd_console.get_input()
+        cursor = "|" if int(time.time() * 2) % 2 == 0 else ""
+        cv2.putText(area, f"{input_str}{cursor}", (20, y_pos), font, 0.45, (230, 230, 235), 1, LT)
+
+# ==========================
+#  OPEN/CLOSE (envuelve ControlLink)
+# ==========================
+def open_port():
+    global control
+    if control is None:
+        raise RuntimeError("ControlLink no inicializado")
+    try:
+        control.open()
+        print(f"✅ Conexión abierta ({control.mode})")
+    except Exception as e:
+        print(f"❌ Error abriendo conexión: {e}")
+        raise
+
+def close_port():
+    global control
+    if control is None:
+        return
+    try:
+        control.close()
+        print(f"✅ Conexión cerrada ({control.mode})")
+    except Exception as e:
+        print(f"⚠️ Error cerrando conexión: {e}")
+
+# ==========================
+#  IA PARA ELEGIR ID
+# ==========================
+async def choose_id_with_openai_async(user_prompt: str, info: str, proc: VideoProcessor = None):
+    """Async LLM call to choose a person/marker ID based on user command and detection data.
+    Uses JSON response format for reliable parsing. Supports clothing, position, name queries."""
+    from openai import AsyncOpenAI
+    import json as _json
+    
+    # --- DEBUG: show what the LLM receives ---
+    print(f"\n[LLM DEBUG] User command: '{user_prompt}'")
+    print(f"[LLM DEBUG] Detection info ({len(info)} chars):")
+    print(info if info else "  (EMPTY - no detections!)")
+    if proc:
+        proc.console.add_output(f"[DEBUG] Comando: '{user_prompt}'")
+        proc.console.add_output(f"[DEBUG] Info al LLM:\n{info if info else '(VACIO)'}")
+    
+    if not info or not info.strip():
+        print("[LLM DEBUG] WARNING: info is empty, LLM has no detections to choose from!")
+        if proc:
+            proc.cmd_console.add_output("No hay detecciones activas para enviar al LLM")
+        return None
+    
+    system_prompt = """You are a navigation assistant for a drone/robot that tracks people.
+Your job: given a user command and a list of detected persons with their attributes, return the correct person ID as JSON.
+
+Each person has these attributes:
+- person_N: the unique ID (e.g. person_1, person_2)
+- Name: face recognition identity (if known)
+- Position: where they are in the frame (far left, left, center, right, far right)
+- Distance: how far they are in meters
+- Angle_X: horizontal angle in degrees (negative=left, positive=right)
+- Upper_clothing: color of their shirt/jacket/upper body
+- Lower_clothing: color of their pants/skirt/lower body
+- Posture: standing, sitting, crouching, or unknown
+- Facing: facing camera, angled, or facing away
+- Size_in_frame: very close/tall, large, medium, small/far (how big they appear)
+- Visibility: torso visibility state (full_torso, partial, upper_only, etc.)
+- Movement: whether they are moving left/right or getting closer/farther (omitted if stationary)
+- Nearby objects: objects detected near them (backpack, cell phone, etc.)
+
+DECISION RULES (in priority order):
+1. If the user says a specific ID like "person 1", "persona 2" → return that ID directly
+2. If the user says a NAME like "go to John", "find María" → match against the Name field
+3. If the user describes CLOTHING like "the one in red", "persona de azul", "guy with black shirt" → match Upper_clothing and Lower_clothing
+4. If the user says POSITION like "the one on the left", "el de la derecha", "center" → match Position field
+5. If the user describes POSTURE like "the sitting one", "el que está sentado", "standing person" → match Posture field
+6. If the user describes ORIENTATION like "the one facing me", "el que está de espaldas" → match Facing field
+7. If the user describes SIZE like "the tall one", "the big one", "el pequeño" → match Size_in_frame field
+8. If the user says "closest", "nearest", "más cercano" → pick the person with smallest Distance
+9. If the user says "farthest", "más lejano" → pick the person with largest Distance
+10. If the user mentions an OBJECT like "person with backpack", "the one with the phone" → match Nearby objects
+11. If the user describes MOVEMENT like "the one coming closer", "el que se mueve a la derecha" → match Movement
+12. For generic commands like "go to person", "ve a la persona", "navigate" → pick the closest person
+13. If the user says "follow", "sigue", "track", "síguelo" → set follow=true
+
+RESPOND WITH ONLY THIS JSON (no explanation, no markdown):
+{"id": "person_N", "follow": false}
+
+Examples:
+- "go to person 1" → {"id": "person_1", "follow": false}
+- "follow the person in blue" → {"id": "person_2", "follow": true}  (if person_2 wears blue)
+- "ve al más cercano" → {"id": "person_1", "follow": false}  (if person_1 is closest)
+- "sigue a Juan" → {"id": "person_3", "follow": true}  (if person_3 is named Juan)
+- "go to the sitting person" → {"id": "person_2", "follow": false}  (if person_2 is sitting)
+- "the one facing away" → {"id": "person_1", "follow": false}  (if person_1 is facing away)
+
+NEVER return null if there is at least one person detected. Always pick the best match."""
+
+    user_msg = f"""User command: "{user_prompt}"
+
+Detected persons:
+{info}
+
+Return JSON:"""
+
+    try:
+        _base_url = os.environ.get("OPENAI_BASE_URL", getattr(Config.AI, 'OPENAI_BASE_URL', None))
+        _api_key = os.environ.get("OPENAI_API_KEY", getattr(Config.AI, 'OPENAI_API_KEY', None))
+        _model = os.environ.get("OPENAI_MODEL", getattr(Config.AI, 'OPENAI_MODEL', "gpt-4o-mini"))
+
+        async_client = AsyncOpenAI(api_key=_api_key, base_url=_base_url)
+        response = await async_client.chat.completions.create(
+            model=_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.1,
+            max_tokens=50
+        )
+        raw_answer = response.choices[0].message.content.strip()
+        print(f"[LLM DEBUG] Raw response: '{raw_answer}'")
+        if proc:
+            proc.cmd_console.add_output(f"IA respuesta: {raw_answer}")
+        
+        # --- Parse JSON response ---
+        follow_mode = False
+        chosen_id = None
+        
+        # Try JSON parsing first
+        try:
+            # Clean potential markdown code blocks
+            clean = raw_answer.strip('` \t\n')
+            if clean.startswith('json'):
+                clean = clean[4:].strip()
+            # Find JSON object in the response
+            json_match = re.search(r'\{[^}]+\}', clean)
+            if json_match:
+                data = _json.loads(json_match.group())
+                chosen_id = data.get('id', data.get('ID', data.get('person', None)))
+                follow_mode = data.get('follow', data.get('Follow', False))
+                if isinstance(follow_mode, str):
+                    follow_mode = follow_mode.lower() in ('true', '1', 'yes', 'si')
+                print(f"[LLM DEBUG] JSON parsed: id={chosen_id}, follow={follow_mode}")
+        except (_json.JSONDecodeError, AttributeError):
+            print(f"[LLM DEBUG] JSON parse failed, falling back to text parsing")
+        
+        # Fallback: text-based parsing (for models that don't follow JSON format)
+        if chosen_id is None:
+            answer = raw_answer.strip('"\'` \t\n')
+            if answer.lower() in ('none', 'null', 'n/a', ''):
+                print(f"[LLM DEBUG] Response is None/empty -> returning None")
+                return None
+            
+            answer_lower = answer.lower().replace(' ', '_')
+            
+            # Check for follow mode in text
+            if answer_lower.startswith('-'):
+                follow_mode = True
+                answer_lower = answer_lower[1:]
+            
+            # Find person_N pattern
+            person_match = re.search(r'person[a]?[_\s]?(\d+)', answer_lower)
+            if person_match:
+                chosen_id = f"person_{person_match.group(1)}"
+            else:
+                # Broader: "person" ... number
+                person_search = re.search(r'person[a]?\D*(\d+)', answer_lower)
+                if person_search:
+                    chosen_id = f"person_{person_search.group(1)}"
+                else:
+                    # Single number fallback
+                    all_nums = re.findall(r'\d+', answer)
+                    if len(all_nums) == 1:
+                        chosen_id = f"person_{all_nums[0]}"
+                    elif len(all_nums) > 1:
+                        # Try integer marker
+                        try:
+                            chosen_id = int(answer_lower.strip())
+                        except ValueError:
+                            pass
+        
+        if chosen_id is None:
+            print(f"[LLM DEBUG] FAILED to parse any ID from: '{raw_answer}'")
+            if proc:
+                proc.cmd_console.add_output(f"No se pudo parsear ID de: '{raw_answer}'")
+            return None
+        
+        # Normalize person ID format
+        if isinstance(chosen_id, str):
+            # Ensure consistent format
+            pm = re.search(r'person[a]?[_\s]?(\d+)', chosen_id.lower())
+            if pm:
+                chosen_id = f"person_{pm.group(1)}"
+        
+        result = ('-' + chosen_id) if (follow_mode and isinstance(chosen_id, str)) else chosen_id
+        if isinstance(chosen_id, int) and follow_mode:
+            result = -chosen_id
+        print(f"[LLM DEBUG] Final result: {result}")
+        return result
+        
+    except Exception as e:
+        print(f"[LLM DEBUG] Exception: {str(e)}")
+        if proc:
+            proc.cmd_console.add_output(f"Error LLM: {str(e)}")
+        return None
+
+def format_detection_info(proc: VideoProcessor) -> str:
+    """Formatea la información para la IA - soporta personas y marcadores.
+    Includes rich attributes derived from already-computed data (zero extra GPU cost)."""
+    lines = []
+    frame_h = proc.frame_height or 720
+    with proc.lock:
+        active = proc._get_active_markers()
+        for mid in active:
+            d = proc.history[mid]
+            
+            # Format differently for persons vs markers
+            if isinstance(mid, str) and mid.startswith('person_'):
+                person_num = mid.split('_')[1]
+                torso_info = d.get('torso_state', 'unknown')
+                pos_label = d.get('position_label', _position_label(d['angle_x']))
+                upper_c = d.get('upper_color', 'unknown')
+                lower_c = d.get('lower_color', 'unknown')
+                
+                # Derive extra attributes from existing data (free)
+                kpts = d.get('keypoints')
+                posture = _estimate_posture(kpts) if kpts is not None else 'unknown'
+                frontal = d.get('frontal_score', 0.5)
+                facing = _facing_label(frontal)
+                bbox = d.get('bbox', (0, 0, 0, 0))
+                size_label = _relative_height_label(bbox, frame_h)
+                
+                # Movement from previous frame
+                dist_move = _movement_label(d['distance'], d.get('prev_distance'))
+                angle_move = _movement_label(d['angle_x'], d.get('prev_angle_x'))
+                
+                # Build description line
+                desc = f"- person_{person_num}: "
+                
+                # Face identity
+                if mid in proc.face_identities:
+                    name, confidence = proc.face_identities[mid]
+                    desc += f"Name=\"{name}\" ({confidence:.0%}), "
+                
+                desc += (
+                    f"Position={pos_label}, "
+                    f"Distance={d['distance']:.2f}m, "
+                    f"Angle_X={d['angle_x']:+.1f}°, "
+                    f"Upper_clothing={upper_c}, "
+                    f"Lower_clothing={lower_c}, "
+                    f"Posture={posture}, "
+                    f"Facing={facing}, "
+                    f"Size_in_frame={size_label}, "
+                    f"Visibility={torso_info}"
+                )
+                
+                # Movement info (only add if meaningful)
+                move_parts = []
+                if dist_move and dist_move != 'stationary':
+                    move_parts.append(f"distance {'closing' if dist_move == 'decreasing' else 'increasing'}")
+                if angle_move and angle_move != 'stationary':
+                    move_parts.append(f"moving {'right' if angle_move == 'increasing' else 'left'}")
+                if move_parts:
+                    desc += f", Movement={' & '.join(move_parts)}"
+                
+                lines.append(desc)
+                
+                # Add nearby objects
+                objs = proc.object_detections.get(mid, [])
+                if objs and proc.object_classes:
+                    obj_strs = [f"{proc.object_classes[o['class_id']]}" for o in objs]
+                    lines.append(f"  Nearby objects: {', '.join(obj_strs)}")
+            else:
+                lines.append(
+                    f"- marker_{mid}: Distance={d['distance']:.2f}m, "
+                    f"Angle_X={d['angle_x']:+.1f}°, Angle_Y={d['angle_y']:+.1f}°"
+                )
+    
+    return "\n".join(lines)
+
+# ==========================
+#  BYTES DE NAVEGACIÓN
+# ==========================
+def send_commands_byte(d: dict, target: float):
+    # Calcula cada booleano (usando umbrales consistentes desde Config)
+    ROTATION_THRESHOLD = getattr(Config.Navigation, 'ROTATION_THRESHOLD', 5)
+    FAST_DISTANCE = getattr(Config.Navigation, 'FAST_SPEED_THRESHOLD', 1.0)
+    
+    rotate_ccw = d['angle_x'] <= -ROTATION_THRESHOLD
+    rotate_cw  = d['angle_x'] >= +ROTATION_THRESHOLD
+    up         = False  # No usado en navegación horizontal
+    down       = False  # No usado en navegación horizontal
+    forward    = d['distance'] > target  # Avanzar si está lejos del objetivo
+    takeoff    = False  # No usado en navegación automática
+    fastFwd    = d['distance'] >= FAST_DISTANCE  # Velocidad rápida si está muy lejos
+    allFast    = False  # No usado
+
+    # Empaqueta en un byte
+    b = (
+        (rotate_ccw << 0) |
+        (rotate_cw  << 1) |
+        (up         << 2) |
+        (down       << 3) |
+        (forward    << 4) |
+        (takeoff    << 5) |
+        (fastFwd    << 6) |
+        (allFast    << 7)
+    )
+    # Enviar por el medio configurado (serial o wifi)
+    control.send(b)
+
+def print_navigation_commands(d: dict, target: float, follow: bool = False):
+    """Muestra los comandos de forma más clara"""
+    ROTATION_THRESHOLD = getattr(Config.Navigation, 'ROTATION_THRESHOLD', 5)
+    FAST_DISTANCE = getattr(Config.Navigation, 'FAST_SPEED_THRESHOLD', 1.0)
+    
+    header = "📍 SEGUIMIENTO ACTIVO" if follow else "🎯 OBJETIVO FIJO"
+    
+    # Calcular comandos reales
+    rotate_ccw = d['angle_x'] <= -ROTATION_THRESHOLD
+    rotate_cw = d['angle_x'] >= +ROTATION_THRESHOLD
+    forward = d['distance'] > target
+    fast_speed = d['distance'] >= FAST_DISTANCE
+    
+    return "\n".join([
+        "",
+        "===============================",
+        f"{header} [ID {d.get('id', '?')}]",
+        "===============================",
+        f"Distancia: {d['distance']:.2f}m (target: {target:.2f}m)",
+        f"Dirección: X:{d['angle_x']:+.1f}° Y:{d['angle_y']:+.1f}°",
+        "",
+        "COMANDOS ACTIVOS:",
+        f"   ➡️  Rotar izquierda:   {'SÍ' if rotate_ccw else 'NO'}",
+        f"   ⬅️  Rotar derecha:     {'SÍ' if rotate_cw else 'NO'}",
+        f"   ⬆️  Avanzar:           {'SÍ' if forward else 'NO'}",
+        f"   ⚡  Velocidad rápida:  {'SÍ' if fast_speed else 'NO'}",
+        f"   🎯 Estado: {'ACERCANDO ({:.2f}m restantes)'.format(d['distance'] - target) if forward else 'EN POSICIÓN'}",
+        "===============================",
+        "",
+    ])
+
+# ==========================
+#  VOZ (WHISPER)
+# ==========================
+def whisper_record_and_transcribe():
+    duration = getattr(getattr(Config, 'AI', None), 'WHISPER_DURATION', 4)
+    language = getattr(getattr(Config, 'AI', None), 'WHISPER_LANGUAGE', 'es')
+    
+    print("🎤 Grabando audio (mantén presionada la tecla)...")
+    
+    audio = sd.rec(int(duration * WHISPER_SAMPLE_RATE), samplerate=WHISPER_SAMPLE_RATE, channels=1, dtype='int16')
+    sd.wait()
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    write(temp_file.name, WHISPER_SAMPLE_RATE, audio)
+    temp_file.close()
+
+    try:
+        print("🧠 Transcribiendo con faster-whisper (4-8x más rápido)...")
+        model = get_whisper_model()
+        # faster-whisper returns segments, not dict
+        segments, info = model.transcribe(temp_file.name, language=language)
+        # Combine all segment texts
+        text = " ".join([segment.text for segment in segments])
+        return text
+    finally:
+        try:
+            os.remove(temp_file.name)
+        except Exception as e:
+            print(f"⚠️ No se pudo eliminar el archivo temporal: {e}")
+
+def voice_input_thread(proc: VideoProcessor):
+    while not proc.stop_event.is_set():
+        if not proc.voice_enabled:
+            time.sleep(0.1)
+            continue
+
+        if not keyboard.is_pressed(Config.Keybinds.KEY_VOICE_RECORD):
+            time.sleep(0.1)
+            continue
+
+        try:
+            texto = whisper_record_and_transcribe()
+            if texto and texto.strip():
+                print(f"[VOZ] {texto}")
+                proc.cmd_console.add_output(f"[VOZ] {texto}")
+                proc.cmd_console.add_output(f"> {texto}")
+                with proc.lock:
+                    proc.cmd_console._cmd_counter += 1  # Trigger prompt_thread
+                proc.cmd_console.clear_input()
+            else:
+                print("🤷 No se detectó ningún texto.")
+                proc.cmd_console.add_output("🤷 No se detectó ningún texto.")
+        except Exception as e:
+            print(f"❌ Error al transcribir: {e}")
+            proc.cmd_console.add_output(f"❌ Error al transcribir: {e}")
+
+        time.sleep(0.5)
+
+# ==========================
+#  ENROLLMENT COMMAND PARSING
+# ==========================
+# Matches: "save person 1 as Yoyo", "add person_2 as Maria", "guardar persona 3 como Juan"
+ENROLL_RE = re.compile(
+    r'(?:save|add|guardar|registrar|remember|name|nombrar)\s+'
+    r'person[a]?[_\s]?(\d+)\s+'
+    r'(?:as|como|=)\s+'
+    r'(.+)',
+    re.IGNORECASE
+)
+
+# Matches: "remove Yoyo", "delete Maria", "borrar Juan", "eliminar persona Maria"
+REMOVE_FACE_RE = re.compile(
+    r'(?:remove|delete|borrar|eliminar)\s+(?:face|persona|person)?\s*(.+)',
+    re.IGNORECASE
+)
+
+def _resolve_name_to_person(proc, name: str):
+    """Find a tracked person_id by their recognised face name.
+    Returns person_id string or None."""
+    name_lower = name.lower().strip()
+    with proc.lock:
+        for pid, (face_name, _sim) in proc.face_identities.items():
+            if face_name.lower() == name_lower:
+                return pid
+    return None
+
+# ==========================
+#  PROMPT THREAD (SELECCIÓN Y NAVEGACIÓN)
+# ==========================
+def prompt_thread(proc):
+    """Hilo mejorado con mayor feedback visual"""
+    _last_processed_counter = -1  # Track last processed command counter (not text)
+    while not proc.stop_event.is_set():
+        time.sleep(0.5)
+        
+        last_command = None
+        current_counter = -1
+        with proc.lock:
+            buf = proc.cmd_console.get_visible_buffer()
+            current_counter = proc.cmd_console._cmd_counter
+            for line in reversed(buf):
+                if line.startswith("> "):
+                    last_command = line[2:]
+                    break
+        
+        if not last_command or current_counter == _last_processed_counter:
+            continue
+        _last_processed_counter = current_counter
+
+        # ─── Handle pending enrollment confirmation ─────────────────
+        if proc.pending_enrollment is not None:
+            pe = proc.pending_enrollment
+            cmd_low = last_command.strip().lower()
+            
+            # Check for timeout (30 seconds)
+            if time.time() - pe['ts'] > 30:
+                proc.pending_enrollment = None
+                proc.cmd_console.add_output("⏰ Enrollment timed out.")
+                continue
+            
+            if cmd_low in ('y', 'yes', 'si', 'sí'):
+                # Execute enrollment
+                pid = pe['person_id']
+                name = pe['name']
+                proc.cmd_console.add_output(f"📸 Enrolling {pid} as '{name}'...")
+                
+                with proc.lock:
+                    person_data = proc.history.get(pid)
+                    raw_frame = proc._raw_frame
+                
+                if person_data is None:
+                    proc.cmd_console.add_output(f"❌ {pid} ya no es visible. Intenta de nuevo.")
+                elif raw_frame is None:
+                    proc.cmd_console.add_output("❌ No hay frame disponible.")
+                elif proc.face_system is None:
+                    proc.cmd_console.add_output("❌ Face recognition not loaded.")
+                else:
+                    kpts = person_data.get('keypoints')
+                    ok, msg = proc.face_system.enroll_person(raw_frame, kpts, name)
+                    if ok:
+                        proc.cmd_console.add_output(f"✅ {msg}")
+                        # Immediately tag this person
+                        with proc.lock:
+                            proc.face_identities[pid] = (name, 1.0)
+                    else:
+                        proc.cmd_console.add_output(f"❌ {msg}")
+                
+                proc.pending_enrollment = None
+                continue
+            
+            elif cmd_low in ('n', 'no'):
+                proc.pending_enrollment = None
+                proc.cmd_console.add_output("❌ Enrollment cancelled.")
+                continue
+            else:
+                # Any other command cancels enrollment implicitly
+                proc.pending_enrollment = None
+                proc.cmd_console.add_output("⚠️ Enrollment cancelled (new command).")
+                # Fall through to process the new command normally
+
+        # ─── Check for enrollment command ───────────────────────────
+        enroll_match = ENROLL_RE.match(last_command)
+        if enroll_match and proc.face_system:
+            person_num = enroll_match.group(1)
+            target_name = enroll_match.group(2).strip()
+            person_id = f"person_{person_num}"
+            
+            with proc.lock:
+                person_exists = person_id in proc.history
+            
+            if not person_exists:
+                proc.cmd_console.add_output(f"❌ {person_id} not found. Make sure they're visible.")
+                continue
+            
+            proc.pending_enrollment = {
+                'person_id': person_id,
+                'name': target_name,
+                'ts': time.time()
+            }
+            proc.cmd_console.add_output(
+                f"📸 Save {person_id} as '{target_name}'?\n"
+                f"   Type 'y' to confirm or 'n' to cancel"
+            )
+            continue
+
+        # ─── Check for face removal command ─────────────────────────
+        remove_match = REMOVE_FACE_RE.match(last_command)
+        if remove_match and proc.face_system:
+            target_name = remove_match.group(1).strip()
+            known = proc.face_system.list_people()
+            # Find case-insensitive match
+            actual_name = None
+            for kn in known:
+                if kn.lower() == target_name.lower():
+                    actual_name = kn
+                    break
+            if actual_name:
+                proc.face_system.remove_person(actual_name)
+                # Clear identity from any tracked person
+                with proc.lock:
+                    for pid in list(proc.face_identities.keys()):
+                        if proc.face_identities[pid][0] == actual_name:
+                            del proc.face_identities[pid]
+                proc.cmd_console.add_output(f"✅ Removed '{actual_name}' from face database.")
+            else:
+                proc.cmd_console.add_output(f"❌ '{target_name}' not found in database. Known: {', '.join(known) if known else '(empty)'}")
+            continue
+
+        if last_command == Config.Keybinds.KEY_MANUAL_TOGGLE:
+            with proc.manual_mode_lock:
+                proc.manual_mode = not proc.manual_mode
+                entering_manual = proc.manual_mode
+            
+            if entering_manual:
+                proc.cmd_console.add_output("🔧 MODO MANUAL ACTIVADO...")
+                try:
+                    manual_control_loop(proc)        # opens/closes port internally
+                    proc.cmd_console.add_output("🔧 MODO MANUAL DESACTIVADO")
+                    last_command = None 
+                except serial.SerialException as e:
+                    proc.cmd_console.add_output(f"❌ Error al abrir el puerto: {e}")
+                    with proc.manual_mode_lock:
+                        proc.manual_mode = False
+                    continue
+            else:
+                close_port()
+            proc.cmd_console.clear_input()
+            continue
+
+        # si estamos en modo manual, ignorar IA
+        with proc.manual_mode_lock:
+            if proc.manual_mode:
+                continue
+        proc.cmd_console.add_output("\n🔍 Procesando solicitud (async - no bloquea UI)...")
+        
+        info = format_detection_info(proc)
+        
+        # ─── Name-based fast-path: "go to Yoyo" → resolve name to person_id ───
+        # Check if the command references a known face name
+        name_resolved_id = None
+        if proc.face_system and proc.face_identities:
+            follow_keywords = ['follow', 'sigue', 'track', 'persigue', 'stay with', 'quedarse']
+            cmd_lower = last_command.lower()
+            is_follow = any(kw in cmd_lower for kw in follow_keywords)
+            
+            # Try each known name against the command
+            for pid, (face_name, _sim) in list(proc.face_identities.items()):
+                if face_name.lower() in cmd_lower:
+                    # Verify person is still active
+                    with proc.lock:
+                        if pid in proc.history:
+                            name_resolved_id = f"-{pid}" if is_follow else pid
+                            proc.cmd_console.add_output(
+                                f"👤 '{face_name}' identificado como {pid}"
+                            )
+                            break
+        
+        # --- Fast-path: skip LLM when only 1 person detected ---
+        chosen_id = name_resolved_id  # May be None or already resolved by name
+        if chosen_id is None:
+            with proc.lock:
+                active = proc._get_active_markers()
+                person_ids = [m for m in active if isinstance(m, str) and m.startswith('person_')]
+            
+            if len(person_ids) == 1:
+                # Check if command implies follow mode
+                follow_keywords = ['follow', 'sigue', 'track', 'persigue', 'stay with', 'quedarse']
+                is_follow = any(kw in last_command.lower() for kw in follow_keywords)
+                sole_person = person_ids[0]
+                if is_follow:
+                    chosen_id = f"-{sole_person}"
+                else:
+                    chosen_id = sole_person
+                proc.cmd_console.add_output(f"✅ Único objetivo detectado: {sole_person} (LLM omitido)")
+            elif len(person_ids) == 0:
+                proc.cmd_console.add_output("⚠️ No hay personas activas detectadas.")
+                print(f"[NAV DEBUG] No active persons. Active markers: {active}")
+                chosen_id = None
+            else:
+                # Multiple persons or markers — use LLM
+                print(f"[NAV DEBUG] {len(person_ids)} persons detected: {person_ids}")
+                proc.console.add_output(f"[DEBUG] {len(person_ids)} personas activas: {person_ids}")
+                chosen_id = asyncio.run(choose_id_with_openai_async(last_command, info, proc))
+        print(f"ID elegido: {chosen_id}")
+        proc.cmd_console.add_output(F"🔍 Seleccionado ID: {chosen_id if chosen_id is not None else 'Ninguno'}")
+        
+        if chosen_id is None:
+            proc.cmd_console.add_output("❌ No se identificó un objetivo claro.\nIntenta ser más específico.")
+            continue
+        else:
+            # Handle both string (person_1) and int (marker ID) formats
+            follow = False
+            if isinstance(chosen_id, str):
+                # String format: check for negative prefix (follow mode)
+                if chosen_id.startswith('-'):
+                    follow = True
+                    chosen_id = chosen_id[1:]  # Remove '-' prefix
+                    proc.cmd_console.add_output("MODO TRACKEO: SIGUIENDO OBJETIVO")
+                else:
+                    proc.cmd_console.add_output("MODO NAVIGACIÓN: LLEGANDO A OBJETIVO")
+            else:
+                # Integer format (legacy ArUco markers)
+                if chosen_id < 0:
+                    follow = True
+                    proc.cmd_console.add_output("MODO TRACKEO: SIGUIENDO OBJETIVO")
+                    chosen_id = abs(chosen_id)
+                elif chosen_id > 0:
+                    follow = False
+                    proc.cmd_console.add_output("MODO NAVIGACIÓN: LLEGANDO A OBJETIVO")
+
+        # Iniciar navegación
+        with proc.lock:
+            proc.selected_id = chosen_id  # Can be string or int now
+            proc.guided_mode = True
+            marker_info = proc.history.get(chosen_id, {})
+            
+            # Format target name
+            if isinstance(chosen_id, str) and chosen_id.startswith('person_'):
+                target_name = f"Person {chosen_id.split('_')[1]}"
+            else:
+                target_name = f"Marker {chosen_id}"
+            
+            proc.cmd_console.add_output(f"""
+🎯 MODO NAVEGACIÓN ACTIVADO ({target_name})
+   Distancia: {marker_info.get('distance', 0):.2f}m
+   Dirección: X:{marker_info.get('angle_x', 0):+.1f}° Y:{marker_info.get('angle_y', 0):+.1f}°
+""")
+        
+        # Bucle de navegación
+        connection_lost_time = None
+        MAX_CONNECTION_LOSS = getattr(Config.Navigation, 'MARKER_LOST_TIMEOUT', 3.0)
+        command_errors = 0
+        MAX_COMMAND_ERRORS = 5  # Máximo de errores consecutivos antes de abortar
+        
+        try:
+            open_port()
+            while not proc.stop_event.is_set():
+                if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV):
+                    proc.cmd_console.add_output(f"🛑 MODO NAVEGACIÓN CANCELADO (tecla {Config.Keybinds.KEY_CANCEL_NAV.upper()})")
+                    break
+                    
+                with proc.lock:
+                    marker_data = proc.history.get(chosen_id)
+                    if marker_data:
+                        # Copy data while under lock, release lock before I/O
+                        marker_data = dict(marker_data)  # shallow copy
+                        connection_lost_time = None
+                    
+                if not marker_data:
+                    if connection_lost_time is None:
+                        connection_lost_time = time.time()
+                        proc.cmd_console.add_output("⚠️ Objetivo perdido, buscando...")
+                    elif time.time() - connection_lost_time > MAX_CONNECTION_LOSS:
+                        proc.cmd_console.add_output("❌ El objetivo se perdió por más de 3 segundos")
+                        break
+                    time.sleep(0.1)
+                    continue
+                        
+                nav_info = print_navigation_commands({'id': chosen_id, **marker_data}, DISTANCE_TARGET, follow)
+                proc.console.add_output(nav_info)
+                
+                try:
+                    send_commands_byte({'id': chosen_id, **marker_data}, DISTANCE_TARGET)
+                    command_errors = 0  # Reset error counter on success
+                except RuntimeError as e:
+                    command_errors += 1
+                    proc.cmd_console.add_output(f"⚠️ Error de comunicación ({command_errors}/{MAX_COMMAND_ERRORS}): {e}")
+                    if command_errors >= MAX_COMMAND_ERRORS:
+                        proc.cmd_console.add_output("❌ Demasiados errores de comunicación, abortando navegación")
+                        break
+                    time.sleep(0.2)
+                    continue
+                except Exception as e:
+                    proc.cmd_console.add_output(f"❌ Error inesperado: {e}")
+                    break
+
+                if not follow:
+                    if marker_data['distance'] <= DISTANCE_TARGET:
+                        proc.cmd_console.add_output("✅ OBJETIVO ALCANZADO")
+                        break
+                        
+                time.sleep(0.5)
+
+        except serial.SerialException as e:
+            proc.cmd_console.add_output(f"❌ Error de comunicación: {e}")
+        except Exception as e:
+            proc.cmd_console.add_output(f"❌ Error inesperado: {e}")
+        finally:
+            close_port()
+            with proc.lock:
+                proc.guided_mode = False
+                proc.selected_id = None
+
+# ==========================
+#  CAPTURAS
+# ==========================
+def capture_scrcpy_window():
+    try:
+        hwnd = win32gui.FindWindow(None, "scrcpy")
+        if not hwnd:
+            raise Exception("scrcpy window not found")
+
+        left_c, top_c, right_c, bottom_c = win32gui.GetClientRect(hwnd)
+        width  = right_c  - left_c
+        height = bottom_c - top_c
+
+        top_left = win32gui.ClientToScreen(hwnd, (left_c, top_c))
+        x, y = top_left
+
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+
+        save_bitmap = win32ui.CreateBitmap()
+        save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(save_bitmap)
+
+        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (x, y), win32con.SRCCOPY)
+
+        bmpinfo = save_bitmap.GetInfo()
+        bmpstr  = save_bitmap.GetBitmapBits(True)
+        # Usar reshape in-place es más rápido
+        img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4)
+        # cvtColor más rápido con flags optimizadas
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        win32gui.DeleteObject(save_bitmap.GetHandle())
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+        return img
+
+    except Exception as e:
+        print(f"Scrcpy capture error: {e}")
+        return None
+
+def capture_thread(src, frame_q, proc):
+    source_type = "default"
+    
+    if src == "scrcpy":
+        source_type = "scrcpy"
+        if not SCRCPY_AVAILABLE:
+            proc.cmd_console.add_output("Error: pywin32 package required for scrcpy capture")
+            proc.stop_event.set()
+            return
+            
+        proc.cmd_console.add_output("Using scrcpy window capture mode")
+        config = SOURCE_CONFIGS[source_type]
+        proc.frame_time = 1.0 / config["target_fps"]
+        
+        while not proc.stop_event.is_set():
+            target = time.time() + proc.frame_time
+            frame = capture_scrcpy_window()
+            if frame is not None:
+                try:
+                    frame_q.put_nowait(frame)
+                except Full:
+                    # Descartar frame viejo si la cola está llena (más rápido)
+                    try:
+                        frame_q.get_nowait()
+                        frame_q.put_nowait(frame)
+                    except Empty:
+                        pass
+            sleep_time = target - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                
+    elif src == "stream" or src.startswith("http"):
+        stream_url = SOURCE_CONFIGS["stream"]["url"] if src == "stream" else src
+        
+        proc.cmd_console.add_output(f"Usando stream HTTP: {stream_url}")
+        
+        cap = cv2.VideoCapture(stream_url)
+        
+        if not cap.isOpened():
+            proc.cmd_console.add_output("Error: No se puede abrir el stream")
+            proc.stop_event.set()
+            return
+        
+        config = SOURCE_CONFIGS["stream"]
+        fps = config["target_fps"]
+        proc.frame_time = 1.0 / fps
+        
+        proc.cmd_console.add_output(f"Stream FPS objetivo: {fps}")
+        
+        while not proc.stop_event.is_set() and cap.isOpened():
+            ret, frame = cap.read()
+            
+            if not ret:
+                proc.cmd_console.add_output("Error: No se puede recibir el frame (Stream terminado?)")
+                time.sleep(1)
+                continue
+            
+            if proc.frame_width and proc.frame_height:
+                if frame.shape[1] != proc.frame_width or frame.shape[0] != proc.frame_height:
+                    frame = cv2.resize(frame, (proc.frame_width, proc.frame_height))
+            
+            try:
+                if frame_q.full():
+                    frame_q.get_nowait()
+                frame_q.put_nowait(frame)
+            except Full:
+                continue
+            # No sleep — cap.read() already blocks until a frame is available
+            
+        cap.release()
+    else:
+        try:
+            src_idx = int(src) if src else 0
+        except:
+            src_idx = 0
+            
+        cap = cv2.VideoCapture(src_idx, cv2.CAP_DSHOW)  # CAP_DSHOW más rápido en Windows
+        config = SOURCE_CONFIGS["default"]
+        
+        # Configuración optimizada de cámara
+        if proc.frame_width and proc.frame_height:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, proc.frame_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, proc.frame_height)
+        
+        # Reducir buffer para menor latencia
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Precalentar: descartar primeros frames (suelen ser oscuros)
+        for _ in range(3):
+            cap.read()
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = config["target_fps"]
+        proc.frame_time = 1.0 / fps
+        
+        proc.cmd_console.add_output(f"Resolución de cámara: {proc.frame_width}x{proc.frame_height}")
+        proc.cmd_console.add_output(f"FPS de cámara: {fps}")
+        
+        while not proc.stop_event.is_set() and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            try:
+                if frame_q.full():
+                    frame_q.get_nowait()
+                frame_q.put_nowait(frame)
+            except Full:
+                continue
+            # No sleep — cap.read() already blocks until a frame is available
+            
+        cap.release()
+        
+    proc.stop_event.set()
+
+# ==========================
+#  PROCESSING WORKER
+# ==========================
+def processing_worker(proc, frame_q):
+    """Process frames from queue — every frame is processed (no skip-dequeue waste)."""
+    process_count = 0
+    last_fps_check = time.time()
+    
+    # Cache config lookups once
+    _perf = getattr(Config, 'Performance', None)
+    fps_low = getattr(_perf, 'FPS_LOW_THRESHOLD', 0.8)
+    fps_high = getattr(_perf, 'FPS_HIGH_THRESHOLD', 1.2)
+    min_interval = getattr(_perf, 'MIN_DETECTION_INTERVAL', 1)
+    max_interval = getattr(_perf, 'MAX_DETECTION_INTERVAL', 10)
+    
+    while not proc.stop_event.is_set():
+        try:
+            frame = frame_q.get(timeout=0.05)
+        except Empty:
+            continue
+        
+        # Process every frame we pull — no skipping
+        try:
+            proc.process_frame(frame)
+            process_count += 1
+        except Exception as e:
+            if not hasattr(proc, '_process_error_count'):
+                proc._process_error_count = 0
+            proc._process_error_count += 1
+            if proc._process_error_count <= 5:
+                print(f"[ERROR] process_frame failed (#{proc._process_error_count}): {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # FPS auto-adjust check (every second)
+        now = time.time()
+        if now - last_fps_check > 1.0:
+            actual_fps = process_count / (now - last_fps_check)
+            
+            if not getattr(proc, 'disable_auto_adjust', False):
+                if actual_fps < proc.target_fps * fps_low:
+                    proc.detection_interval = min(max_interval, proc.detection_interval + 1)
+                elif actual_fps > proc.target_fps * fps_high:
+                    proc.detection_interval = max(min_interval, proc.detection_interval - 1)
+            
+            process_count = 0
+            last_fps_check = now
+
+# ==========================
+#  DISPLAY
+# ==========================
+def display_thread(proc):
+    # Espera optimizada con timeout
+    max_wait = 2.0
+    start_wait = time.time()
+    while not hasattr(proc, 'frame_time'):
+        if time.time() - start_wait > max_wait:
+            proc.frame_time = 1.0 / 30
+            break
+        time.sleep(0.05)
+    
+    delay = 1  # Minimal waitKey delay — render as fast as possible
+    
+    cv2.namedWindow('SIGO', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow('SIGO', 1280, 720)
+    cv2.setWindowProperty('SIGO', cv2.WND_PROP_TOPMOST, 0)
+    
+    last_frame_time = time.time()
+    fps_counter = 0
+    displayed_fps = 0
+    first_frame = True
+    last_rendered_gen = -1
+    cached_display = None
+    
+    while not proc.stop_event.is_set():
+        if proc.processed_frame is None:
+            # No frame yet — use longer waitKey to avoid CPU spin while still handling keys
+            key = cv2.waitKey(30) & 0xFF
+            if key == Config.Keybinds.KEY_EXIT:
+                proc.stop_event.set()
+                break
+            continue
+        
+        first_frame = False
+            
+        current_time = time.time()
+        fps_counter += 1
+        if current_time - last_frame_time >= 1.0:
+            displayed_fps = fps_counter
+            fps_counter = 0
+            last_frame_time = current_time
+        
+        # Only re-render GUI when a new processed frame is available
+        current_gen = proc._frame_gen
+        if current_gen != last_rendered_gen:
+            last_rendered_gen = current_gen
+            cached_display = proc._render_gui(proc.processed_frame)
+            
+            if cached_display is not None:
+                # FPS badge on fresh render
+                fps_text = f"{displayed_fps} FPS"
+                fps_color = (0, 255, 100) if displayed_fps >= 20 else ((0, 200, 255) if displayed_fps >= 10 else (80, 80, 255))
+                cv2.putText(cached_display, fps_text, (12, 26), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.50, fps_color, 1, cv2.LINE_8)
+                cv2.imshow('SIGO', cached_display)
+        
+        # waitKey(1) = minimal blocking, just enough for OpenCV event pump
+        key = cv2.waitKey(delay) & 0xFF
+
+        if key == Config.Keybinds.KEY_EXIT:  # TAB key
+            print("\n🛑 Cerrando SIGO (TAB detectado)...")
+            proc.stop_event.set()
+            break  # Salir inmediatamente del loop
+
+        with proc.manual_mode_lock:
+            if proc.manual_mode:
+                continue
+
+        if key == Config.Keybinds.KEY_BACKSPACE:
+            proc.cmd_console.backspace()
+        elif key == Config.Keybinds.KEY_ENTER:
+            if proc.cmd_console.get_input():
+                cmd = proc.cmd_console.get_input()
+                proc.cmd_console.add_output(f"> {cmd}")
+                proc.cmd_console.add_to_history(cmd)
+                with proc.lock:
+                    proc.cmd_console._cmd_counter += 1  # Bump counter so prompt_thread sees new command
+                proc.cmd_console.clear_input()
+        elif key == Config.Keybinds.KEY_FACE_RECOGNITION:
+            # Toggle face recognition on/off
+            if FACE_RECOGNITION_AVAILABLE:
+                proc.face_recognition_enabled = not proc.face_recognition_enabled
+                if proc.face_recognition_enabled:
+                    if proc.face_system is None:
+                        proc.cmd_console.add_output("🔄 Loading face recognition (ArcFace)...")
+                        try:
+                            proc.face_system = LiveFaceRecognition(
+                                database_dir=getattr(Config.AI, 'FACE_DATABASE_DIR', 'face_database')
+                            )
+                            people = proc.face_system.list_people()
+                            proc.cmd_console.add_output(f"✅ Face recognition ON ({len(people)} enrolled)")
+                        except Exception as e:
+                            proc.cmd_console.add_output(f"❌ Face recognition error: {e}")
+                            proc.face_recognition_enabled = False
+                    else:
+                        people = proc.face_system.list_people()
+                        proc.cmd_console.add_output(f"✅ Face recognition ON ({len(people)} enrolled)")
+                else:
+                    proc.cmd_console.add_output("⏸️ Face recognition OFF")
+            else:
+                proc.cmd_console.add_output("❌ Face recognition unavailable (onnxruntime + ArcFace model required)")
+        elif key in Config.Keybinds.KEY_ARROW_PREFIX:
+            key2 = cv2.waitKey(1) & 0xFF
+            if key2 == Config.Keybinds.KEY_ARROW_UP:
+                proc.cmd_console.history_up()
+            elif key2 == Config.Keybinds.KEY_ARROW_DOWN:
+                proc.cmd_console.history_down()
+        elif 32 <= key <= 126:
+            # Skip number-row hotkeys so they don't get typed as text
+            hotkey_codes = {
+                ord(Config.Keybinds.KEY_VOICE_RECORD),      # 3
+                Config.Keybinds.KEY_FACE_RECOGNITION,        # 4
+                ord(Config.Keybinds.KEY_CANCEL_NAV),         # 5
+                ord(Config.Keybinds.KEY_MANUAL_TOGGLE),      # 7
+            }
+            if key not in hotkey_codes:
+                proc.cmd_console.add_to_input(chr(key))
+        
+    cv2.destroyAllWindows()
+
+# ==========================
+#  MODO MANUAL
+# ==========================
+def manual_control_loop(proc: VideoProcessor):
+    """
+    Bucle de control manual: teclas configurables en config.py
+    Envía el byte cada 500 ms (incluso si es 0). Sale con KEY_MANUAL_EXIT o cuando se desactiva manual_mode.
+    """
+    try:
+        open_port()
+
+        KEY_BIT = Config.Keybinds.get_manual_key_bits()
+
+        prev_states = {k: False for k in KEY_BIT}
+        last_send = time.time()
+
+        while not proc.stop_event.is_set():
+            with proc.manual_mode_lock:
+                if not proc.manual_mode:
+                    break
+            # salir con KEY_MANUAL_EXIT
+            if keyboard.is_pressed(Config.Keybinds.KEY_MANUAL_EXIT):
+                proc.console.add_output(f"[MANUAL] tecla {Config.Keybinds.KEY_MANUAL_EXIT} PRESIONADA → saliendo")
+                break
+
+            curr_states = {k: keyboard.is_pressed(k) for k in KEY_BIT}
+
+            for k, curr in curr_states.items():
+                if curr != prev_states[k]:
+                    estado = "PRESIONADA" if curr else "LIBERADA"
+                    proc.console.add_output(f"[MANUAL] tecla {k.upper()} {estado}")
+            prev_states = curr_states
+
+            if time.time() - last_send >= 0.5:
+                byte = 0
+                for k, bit in KEY_BIT.items():
+                    if curr_states[k]:
+                        byte |= bit
+
+                control.send(byte)
+                proc.console.add_output(f"[MANUAL] enviado byte: {byte:08b}")
+                last_send = time.time()
+
+            time.sleep(0.01)
+            
+    except serial.SerialException as e:
+        proc.console.add_output(f"[MANUAL] Error de comunicación (serial): {e}")
+    except Exception as e:
+        proc.console.add_output(f"[MANUAL] Error inesperado: {e}")
+    finally:
+        close_port()    
+
+    with proc.manual_mode_lock:
+        proc.manual_mode = False
+    proc.cmd_console.add_output("[MANUAL] modo manual finalizado")
+
+# ==========================
+#  MAIN
+# ==========================
+if __name__ == '__main__':
+    # Configuraciones por tipo de fuente (incluye modo de control)
+    SOURCE_CONFIGS = {
+        "default": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 5,
+            "target_fps": 30,
+            "control": "wifi"   # cámara local → WiFi
+        },
+        "scrcpy": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 5,
+            "target_fps": 30,
+            "control": "serial"   # scrcpy → Serial
+        },
+        "stream": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 1,
+            "target_fps": 15,
+            "url": f"http://{CamIP}/stream",
+            "control": "wifi",
+             # stream IP → WiFi
+        }
+    }
+
+    # Solicitar tipo de fuente
+    print("Selecciona la fuente de video:")
+    print("1 - Cámara local")
+    print("2 - Scrcpy (Android)")
+    print(f"3 - Stream HTTP ({CamIP})")
+    print("4 - Especificar URL personalizada")
+    
+    source_choice = input("Opción [1-4]: ").strip()
+    
+    if source_choice == "1":
+        src = "0"
+        source_type = "default"
+    elif source_choice == "2":
+        src = "scrcpy"
+        source_type = "scrcpy"
+    elif source_choice == "3":
+        src = "stream"
+        source_type = "stream"
+    elif source_choice == "4":
+        src = input("Introduce la URL del stream: ").strip()
+        source_type = "stream"
+    else:
+        src = "0"
+        source_type = "default"
+    
+    # Inicializar el procesador con el tipo de fuente
+    proc = VideoProcessor(source_type=source_type)
+    
+    # Apply framerate mode from config
+    framerate_mode = getattr(getattr(Config, 'Performance', None), 'FRAMERATE_MODE', 'auto')
+    if framerate_mode == 'high':
+        proc.detection_interval = 1
+        proc.disable_auto_adjust = True
+        proc.cmd_console.add_output("🚀 Modo FPS ALTO: detección cada frame (máximo rendimiento)")
+    elif framerate_mode == 'medium':
+        proc.detection_interval = 3
+        proc.disable_auto_adjust = True
+        proc.cmd_console.add_output("⚖️ Modo FPS MEDIO: detección cada 3 frames (balanceado)")
+    elif framerate_mode == 'low':
+        proc.detection_interval = 5
+        proc.disable_auto_adjust = True
+        proc.cmd_console.add_output("🐢 Modo FPS BAJO: detección cada 5 frames (ahorro de recursos)")
+    else:  # 'auto'
+        proc.disable_auto_adjust = False
+        proc.cmd_console.add_output("🤖 Modo FPS AUTO: ajuste dinámico basado en rendimiento")
+    
+    proc.show_video_info = True  # Show detection info overlay
+    
+    # Optimización: Si solo usa pose (no ArUco), detección más frecuente
+    if not getattr(getattr(Config, 'AI', None), 'USE_ARUCO_MARKERS', False):
+        proc.detection_interval = 2  # Más frecuente para pose-only
+    
+    # Cargar calibración solo si se usa ArUco (optimización de inicio)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cal_file = SOURCE_CONFIGS[source_type]["calibration"]
+    cal_path = os.path.join(script_dir, cal_file)
+    
+    if proc.use_aruco:
+        # Carga completa de calibración para ArUco
+        if not os.path.exists(cal_path):
+            proc.cmd_console.add_output(f"Advertencia: Archivo de calibración '{cal_file}' no encontrado")
+            cal_path = os.path.join(script_dir, SOURCE_CONFIGS["default"]["calibration"])
+            if not os.path.exists(cal_path):
+                raise FileNotFoundError(f"Archivo de calibración por defecto '{cal_path}' no encontrado")
+        
+        try:
+            data = np.load(cal_path)
+            required_keys = ['K', 'D', 'width', 'height']
+            if not all(key in data for key in required_keys):
+                raise ValueError(f"Archivo de calibración incompleto. Se requieren: {required_keys}")
+            
+            proc.K = data['K']
+            proc.D = data['D']
+            proc.frame_width = int(data['width'])
+            proc.frame_height = int(data['height'])
+            
+            # Validar datos de calibración
+            if proc.K.shape != (3, 3) or proc.D.shape[0] < 4:
+                raise ValueError("Formato de calibración inválido")
+            if proc.frame_width <= 0 or proc.frame_height <= 0:
+                raise ValueError("Dimensiones de frame inválidas")
+            
+            proc.calibration_loaded = True
+                
+        except Exception as e:
+            raise RuntimeError(f"Error cargando calibración desde '{cal_path}': {e}")
+
+        fx, fy = proc.K[0,0], proc.K[1,1]
+        proc.fov_x, proc.fov_y = compute_fov(fx, fy, proc.frame_width, proc.frame_height)
+    else:
+        # Solo cargar dimensiones para pose-only (mucho más rápido)
+        try:
+            data = np.load(cal_path)
+            proc.frame_width = int(data.get('width', 640))
+            proc.frame_height = int(data.get('height', 480))
+        except:
+            # Valores por defecto si falla
+            proc.frame_width = 640
+            proc.frame_height = 480
+        
+        # FOV aproximado para pose
+        proc.fov_x = 60.0
+        proc.fov_y = 45.0
+    
+    # Inicializar consola
+    proc.console = ConsoleBuffer()
+    proc.cmd_console = ConsoleBuffer()
+    if proc.use_aruco:
+        proc.cmd_console.add_output(f"Usando calibración: {cal_file}")
+    else:
+        proc.cmd_console.add_output(f"⚡ Modo rápido: Pose-only (sin calibración ArUco)")
+    proc.cmd_console.add_output(f"Horizontal FoV: {proc.fov_x:.2f}° | Vertical FoV: {proc.fov_y:.2f}°")
+    proc.cmd_console.add_output(f"Intervalo de detección: {proc.detection_interval} frames")
+    proc.cmd_console.add_output(f"FPS objetivo: {proc.target_fps}")
+
+    # Crear adaptador de control según la fuente
+    cfg = SOURCE_CONFIGS[source_type]
+    control_mode = cfg.get("control", "serial")
+    
+    # Crear cola de frames (usar tamaño de config)
+    frame_queue_size = getattr(getattr(Config, 'Performance', None), 'FRAME_QUEUE_SIZE', 2)
+    
+    control = ControlLink(
+        mode=control_mode,
+        serial_port=PUERTO,
+        serial_baud=BAUD,
+        serial_timeout=1,
+        wifi_ip=CarIP,
+        wifi_port=ESP_PORT
+    )
+    
+    proc.cmd_console.add_output(f"🔌 Control: {control_mode.upper()}")
+    if control_mode == "serial":
+        proc.cmd_console.add_output(f"   Puerto: {PUERTO} @ {BAUD} baud")
+    else:
+        proc.cmd_console.add_output(f"   WiFi: {CarIP}:{ESP_PORT}")
+    proc.cmd_console.add_output(f"📋 Cola de frames: {frame_queue_size}")
+    proc.cmd_console.add_output("")
+    proc.cmd_console.add_output("⌨️  CONTROLES:")
+    proc.cmd_console.add_output(f"   TAB = Salir del programa")
+    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_VOICE_RECORD} = Grabar comando de voz")
+    proc.cmd_console.add_output(f"   {chr(Config.Keybinds.KEY_FACE_RECOGNITION)} = Reconocimiento facial")
+    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = Cancelar navegación")
+    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
+    proc.cmd_console.add_output("")
+
+    # ─── Auto-load face recognition (ArcFace via ONNX) ────────────────
+    if FACE_RECOGNITION_AVAILABLE:
+        try:
+            db_dir = getattr(getattr(Config, 'AI', None), 'FACE_DATABASE_DIR', 'face_database')
+            proc.face_system = LiveFaceRecognition(database_dir=db_dir)
+            proc.face_recognition_enabled = True
+            people = proc.face_system.list_people()
+            proc.cmd_console.add_output(f"👤 Face recognition ON — {len(people)} enrolled")
+            if people:
+                proc.cmd_console.add_output(f"   Known: {', '.join(people)}")
+        except Exception as e:
+            proc.cmd_console.add_output(f"⚠️ Face recognition unavailable: {e}")
+            proc.face_recognition_enabled = False
+    proc.cmd_console.add_output("")
+
+    frame_q = Queue(maxsize=frame_queue_size)
+
+    # Crear e iniciar hilos
+    threads = [
+        threading.Thread(target=capture_thread, args=(src, frame_q, proc)),
+        threading.Thread(target=processing_worker, args=(proc, frame_q)),
+        threading.Thread(target=display_thread, args=(proc,)),
+        threading.Thread(target=prompt_thread, args=(proc,)),
+        threading.Thread(target=voice_input_thread, args=(proc,))
+    ]
+
+    for t in threads:
+        t.daemon = True
+        t.start()
+
+    # Esperar a que los hilos terminen
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupción por teclado (Ctrl+C), terminando...")
+        proc.stop_event.set()
+
+    # Dar tiempo para que los threads se enteren del stop
+    print("\n🔄 Esperando que los threads terminen...")
+    time.sleep(0.5)
+
+    # Cerrar enlace de control (serial o wifi)
+    try:
+        close_port()
+    except Exception as e:
+        print(f"⚠️ Error cerrando puerto: {e}")
+
+    # Esperar a que los hilos terminen (con timeout más corto)
+    print("🧹 Limpiando recursos...")
+    for i, t in enumerate(threads):
+        t.join(timeout=0.5)
+        if t.is_alive():
+            print(f"⚠️ Thread {i} no terminó a tiempo")
+
+    cv2.destroyAllWindows()
+    print("✅ SIGO cerrado correctamente\n")

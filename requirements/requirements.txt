@@ -1,0 +1,61 @@
+# SIGO - Sistema Inteligente de Guiado y Orientación
+# Dependencies for Python 3.12+
+# Updated: February 2026
+
+# ========================================
+# CORE VISION & AI (GPU Accelerated)
+# ========================================
+
+# PyTorch with CUDA support
+# For RTX 50-series (Blackwell): pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+# For RTX 20/30/40-series: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# For CPU only: pip install torch torchvision torchaudio
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+
+# Computer Vision
+opencv-python>=4.10.0,<5.0.0
+opencv-contrib-python>=4.10.0
+
+# Object Detection
+ultralytics>=8.3.0,<9.0.0
+
+# ========================================
+# AI & NLP
+# ========================================
+
+# OpenAI API (also used for Ollama local LLM)
+openai>=1.55.0,<2.0.0
+
+# Speech Recognition (faster-whisper: 4x faster than openai-whisper)
+faster-whisper>=1.1.0
+
+# ========================================
+# NUMERICAL & SCIENTIFIC
+# ========================================
+
+numpy>=1.26.0
+scipy>=1.14.0
+
+# ========================================
+# AUDIO
+# ========================================
+
+sounddevice>=0.5.1
+
+# ========================================
+# HARDWARE CONTROL
+# ========================================
+
+pyserial>=3.5
+keyboard>=0.13.5
+
+# Windows-specific (scrcpy support)
+pywin32>=308; sys_platform == 'win32'
+
+# ========================================
+# PERFORMANCE BOOSTERS
+# ========================================
+
+numba>=0.60.0

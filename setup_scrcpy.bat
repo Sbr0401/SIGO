@@ -19,7 +19,7 @@ set "SCRCPY_EXE=%SCRCPY_DIR%\scrcpy.exe"
 set "ADB_EXE=%SCRCPY_DIR%\adb.exe"
 
 REM Optimal scrcpy settings for SIGO
-set "SCRCPY_MAX_SIZE=1280"
+set "SCRCPY_MAX_SIZE=2340"
 set "SCRCPY_BIT_RATE=8M"
 set "SCRCPY_MAX_FPS=30"
 

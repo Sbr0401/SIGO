@@ -22,6 +22,10 @@ import tempfile
 import torch
 import socket
 import asyncio
+import ctypes
+import math
+import subprocess
+import shutil
 from dataclasses import dataclass
 from typing import Optional, List
 import numpy.typing as npt
@@ -33,7 +37,17 @@ try:
 except ImportError:
     SCRCPY_AVAILABLE = False
 
+# Declare DPI awareness so GetClientRect returns real pixels (not scaled)
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Per-Monitor DPI Aware
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()    # Fallback (System DPI Aware)
+    except Exception:
+        pass
+
 import serial
+import serial.tools.list_ports
 
 # Facial recognition system (ArcFace via ONNX Runtime)
 try:
@@ -53,21 +67,79 @@ except ImportError:
         class Hardware:
             SERIAL_PORT = 'COM8'
             SERIAL_BAUD = 9600
+            SERIAL_TIMEOUT = 1
+            SERIAL_RECONNECT_GRACE = 15
             CAMERA_IP = "192.168.165.106"
             VEHICLE_IP = "192.168.165.76"
             ESP_PORT = 5555
         class AI:
+            OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "ollama")
+            OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
             OPENAI_MODEL = "gpt-4o-mini"
+            OPENAI_TEMPERATURE = 0.1
+            OPENAI_MAX_TOKENS = 10
             WHISPER_MODEL_SIZE = "tiny"
             WHISPER_LANGUAGE = "es"
+            WHISPER_SAMPLE_RATE = 16000
+            WHISPER_DURATION = 4
+            YOLO_MODEL = 'yolo11n.pt'
             YOLO_CONFIDENCE = 0.5
+            USE_POSE_DISTANCE = True
+            POSE_MODEL = 'yolov8s-pose.pt'
+            USE_ARUCO_MARKERS = False
+            USE_FACE_RECOGNITION = True
+            FACE_DATABASE_DIR = 'face_database'
+            FACE_RECOGNITION_THRESHOLD = 0.35
+            FACE_MODEL_PATH = os.path.expanduser('~/.insightface/models/buffalo_l/w600k_r50.onnx')
+            FOCAL_LENGTH_PIX = None
+            @staticmethod
+            def get_focal_length(calibration_file=None):
+                return None
         class Navigation:
-            DISTANCE_TARGET = 0.3
+            DISTANCE_TARGET = 1.5
+            DISTANCE_CORRECTION = 1.0
             ROTATION_THRESHOLD = 5
+            FAST_SPEED_THRESHOLD = 1.0
             MARKER_LOST_TIMEOUT = 3.0
+            MARKER_EXPIRE_TIME = 2.0
+            DETECTION_RADIUS_SCALE = 2.0
+            NAVIGATION_UPDATE_RATE = 0.5
+            MANUAL_SEND_RATE = 0.5
         class Vision:
             ARUCO_MARKER_SIZE = 0.20
+            ROI_EXPANSION_SCALE = 1.2
             SMOOTH_WINDOW_SIZE = 5
+            GAMMA_CORRECTION = 1.2
+        class Source:
+            SOURCES = {
+                "default": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "wifi"},
+                "scrcpy": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "serial"},
+                "stream": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 1, "target_fps": 15, "control": "wifi"},
+            }
+        class UI:
+            OUTPUT_WIDTH = 1280
+            OUTPUT_HEIGHT = 720
+            VIDEO_WIDTH_RATIO = 0.7
+            CONSOLE_WIDTH_RATIO = 0.3
+            INPUT_HEIGHT = 40
+            MAX_CONSOLE_LINES = 100
+            MAX_COMMAND_HISTORY = 50
+        class Keybinds:
+            KEY_EXIT = 9
+            KEY_BACKSPACE = 8
+            KEY_ENTER = 13
+            KEY_VOICE_RECORD = '3'
+            KEY_CANCEL_NAV = '5'
+            KEY_SAFE_MODE = ord('6')
+            KEY_FACE_RECOGNITION = ord('4')
+            KEY_MANUAL_TOGGLE = '7'
+            KEY_MANUAL_EXIT = '7'
+        class Performance:
+            FRAME_QUEUE_SIZE = 1
+            FRAMERATE_MODE = 'auto'
+        class Debug:
+            SHOW_VIDEO_INFO = False
+            VERBOSE_LOGGING = False
 
 # ==========================
 #  CONFIG WHISPER / AUDIO
@@ -95,14 +167,123 @@ PUERTO = getattr(Config.Hardware, 'SERIAL_PORT', 'COM8')
 BAUD   = getattr(Config.Hardware, 'SERIAL_BAUD', 9600)
 
 CamIP = getattr(Config.Hardware, 'CAMERA_IP', '192.168.165.106')
+
+def detect_phone_gateway():
+    """Auto-detect phone hotspot IP from WiFi gateway (Windows)."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             '(Get-NetIPConfiguration | Where-Object { $_.InterfaceAlias -match "Wi-Fi|WiFi|Wireless|WLAN" -and $_.IPv4DefaultGateway } | Select-Object -First 1).IPv4DefaultGateway.NextHop'],
+            capture_output=True, text=True, timeout=10
+        )
+        ip = result.stdout.strip()
+        if ip and ip[0].isdigit():
+            return ip
+    except Exception:
+        pass
+    return None
 CarIP = getattr(Config.Hardware, 'VEHICLE_IP', '192.168.165.76')
 ESP_PORT = getattr(Config.Hardware, 'ESP_PORT', 5555)
+RECONNECT_GRACE = getattr(Config.Hardware, 'SERIAL_RECONNECT_GRACE', 15)
+
+def resolve_face_database_dir() -> str:
+    """Resolve a stable face database path independent of current working directory.
+
+    Priority:
+    1) Existing configured path from current CWD (legacy behavior)
+    2) Existing workspace-root path (one level above SIGO-FINAL)
+    3) Existing SIGO-FINAL local path
+    4) Fallback to workspace-root path (created by face system if missing)
+    """
+    configured = getattr(getattr(Config, 'AI', None), 'FACE_DATABASE_DIR', 'face_database')
+    if os.path.isabs(configured):
+        return configured
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))            # .../SIGO-FINAL
+    workspace_root = os.path.dirname(script_dir)                       # .../SIGOOOOO
+
+    candidates = [
+        os.path.abspath(configured),
+        os.path.join(workspace_root, configured),
+        os.path.join(script_dir, configured),
+    ]
+
+    for path in candidates:
+        face_db_file = os.path.join(path, 'face_db.pkl')
+        if os.path.exists(face_db_file):
+            return path
+
+    for path in candidates:
+        if os.path.isdir(path) and len(os.listdir(path)) > 0:
+            return path
+
+    return os.path.join(workspace_root, configured)
+
+# ==========================
+#  ARDUINO AUTO-DETECT & PROTOCOL
+# ==========================
+def detect_arduino_port():
+    """Auto-detect Arduino Nano COM port by scanning serial ports.
+    Nano clones typically use CH340; official ones use FTDI or ATmega16U2."""
+    try:
+        import serial.tools.list_ports
+        ports = list(serial.tools.list_ports.comports())
+        # Priority 1: official Arduino VIDs (ATmega16U2 on genuine Nano)
+        ARDUINO_VIDS = ['2341', '2a03']           # Arduino SA, Arduino SRL
+        # Priority 2: USB-serial chips common on Nano clones
+        #   1a86 = CH340/CH341 (most common Nano clone chip)
+        #   0403 = FTDI FT232RL (older genuine Nano)
+        #   10c4 = CP210x (rare)
+        CHIP_VIDS    = ['1a86', '0403', '10c4']
+        DESC_HINTS   = ['arduino', 'nano', 'ch340', 'ch341', 'ft232',
+                        'ftdi', 'cp210', 'usb serial', 'usb-serial']
+        for port in ports:
+            hwid = (port.hwid or '').lower()
+            if any(vid in hwid for vid in ARDUINO_VIDS):
+                return port.device
+        for port in ports:
+            desc = (port.description or '').lower()
+            hwid = (port.hwid or '').lower()
+            if any(vid in hwid for vid in CHIP_VIDS) or any(h in desc for h in DESC_HINTS):
+                return port.device
+        # Fallback: first available COM port that isn't COM1
+        for port in ports:
+            if port.device.upper() != 'COM1':
+                return port.device
+    except Exception:
+        pass
+    return None
+
+def encode_arduino_pair(ccw=0, cw=0, up=0, down=0, fwd=0, bwd=0):
+    """Encode 6 channels with magnitude levels (0-3) into 2-byte Arduino protocol.
+
+    Each channel N is encoded across b1[N] and b2[N]:
+      mag 0  → b1=0 b2=0  → Arduino getMag returns  0  (off)
+      mag 1  → b1=1 b2=0  → Arduino getMag returns 10  (light)
+      mag 2  → b1=0 b2=1  → Arduino getMag returns 20  (medium)
+      mag 3  → b1=1 b2=1  → Arduino getMag returns 30  (strong)
+    """
+    channels = [ccw, cw, up, down, fwd, bwd]
+    b1 = 0
+    b2 = 0
+    for i, mag in enumerate(channels):
+        mag = max(0, min(3, int(mag)))
+        if mag & 1:          # low bit of magnitude → b1
+            b1 |= (1 << i)
+        if mag & 2:          # high bit of magnitude → b2
+            b2 |= (1 << i)
+    return b1, b2
 
 # --- Adaptador unificado de control (Serial o WiFi) ---
 class ControlLink:
-    def __init__(self, mode: str, serial_port='COM8', serial_baud=9600, serial_timeout=1, wifi_ip=None, wifi_port=None):
+    def __init__(self, mode: str, serial_port='auto', serial_baud=9600,
+                 serial_timeout=1, wifi_ip=None, wifi_port=None,
+                 reconnect_grace=15):
         """
         mode: 'serial' o 'wifi'
+        serial_port: COM port or 'auto' to scan for Arduino
+        reconnect_grace: seconds to attempt reconnection before giving up
         """
         self.mode = mode
         self.serial_port = serial_port
@@ -110,30 +291,45 @@ class ControlLink:
         self.serial_timeout = serial_timeout
         self.wifi_ip = wifi_ip
         self.wifi_port = wifi_port
+        self.reconnect_grace = reconnect_grace
 
         self._ser = None   # serial.Serial()
         self._sock = None  # socket.socket()
+        self._resolved_port = None  # actual COM port in use
+
+    def _resolve_port(self):
+        """Resolve 'auto' to an actual COM port, or use the configured one."""
+        if self.serial_port.lower() == 'auto':
+            port = detect_arduino_port()
+            if not port:
+                raise RuntimeError(
+                    "No se detectó Arduino en ningún puerto COM.\n"
+                    "  - Verifica que el cable USB está conectado\n"
+                    "  - Verifica que el driver (CH340/FTDI) está instalado\n"
+                    "  - O configura SERIAL_PORT manualmente en config.py"
+                )
+            return port
+        return self.serial_port
 
     def open(self):
         if self.mode == 'serial':
+            self._resolved_port = self._resolve_port()
             if self._ser is None:
                 self._ser = serial.Serial()
-                self._ser.port = self.serial_port
-                self._ser.baudrate = self.serial_baud
-                self._ser.timeout = self.serial_timeout
+            self._ser.port = self._resolved_port
+            self._ser.baudrate = self.serial_baud
+            self._ser.timeout = self.serial_timeout
             if not self._ser.is_open:
                 self._ser.open()
-            print(f"✅ [CTRL] Serial abierto en {self._ser.port}@{self._ser.baudrate}")
+            print(f"[CTRL] Serial abierto en {self._ser.port}@{self._ser.baudrate}")
 
         elif self.mode == 'wifi':
-            # si no hay conexión, conectar (create fresh socket if stale)
             try:
                 if self._sock is not None:
-                    self._sock.getpeername()  # raises if not connected
+                    self._sock.getpeername()
                 else:
                     raise OSError("No socket")
             except Exception:
-                # Close stale socket if any, then create a fresh one
                 if self._sock is not None:
                     try:
                         self._sock.close()
@@ -142,37 +338,78 @@ class ControlLink:
                 self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self._sock.settimeout(3)
                 self._sock.connect((self.wifi_ip, self.wifi_port))
-            print(f"✅ [CTRL] WiFi conectado a {self.wifi_ip}:{self.wifi_port}")
+            print(f"[CTRL] WiFi conectado a {self.wifi_ip}:{self.wifi_port}")
 
-    def send(self, b: int):
-        """Envía un solo byte (0-255) por el medio seleccionado."""
-        b = int(b) & 0xFF
+    def send(self, b1: int, b2: int = 0):
+        """Send a 2-byte command pair to the Arduino.
+        b1, b2 encode channel magnitudes (see encode_arduino_pair).
+        """
+        b1 = int(b1) & 0xFF
+        b2 = int(b2) & 0xFF
         if self.mode == 'serial':
             if not self._ser or not self._ser.is_open:
                 raise RuntimeError("Serial no abierto - revisa conexión USB")
             try:
-                self._ser.write(bytes([b]))
+                self._ser.write(bytes([b1, b2]))
                 self._ser.flush()
-            except serial.SerialTimeoutException:
-                raise RuntimeError("Timeout serial - dispositivo no responde")
-            except serial.SerialException as e:
-                raise RuntimeError(f"Error serial: {e}")
+            except (serial.SerialException, OSError) as e:
+                # Attempt reconnection
+                if self._try_reconnect():
+                    self._ser.write(bytes([b1, b2]))
+                    self._ser.flush()
+                else:
+                    raise RuntimeError(f"Arduino desconectado y no se pudo reconectar en {self.reconnect_grace}s: {e}")
+
         elif self.mode == 'wifi':
             if not self._sock:
                 raise RuntimeError("Socket no abierto - revisa conexión WiFi")
             try:
-                self._sock.sendall(bytes([b]))
+                self._sock.sendall(bytes([b1, b2]))
             except socket.timeout:
-                raise RuntimeError("Timeout WiFi - ESP no responde (verifica IP/conexión)")
+                raise RuntimeError("Timeout WiFi - ESP no responde")
             except (BrokenPipeError, ConnectionResetError) as e:
                 raise RuntimeError(f"Conexión WiFi perdida: {e}")
             except socket.error as e:
                 raise RuntimeError(f"Error de red: {e}")
 
+    def _try_reconnect(self):
+        """Attempt to reconnect to the Arduino within the grace period.
+        Scans for the port again in case it moved to a different COM."""
+        print(f"[CTRL] Arduino desconectado. Intentando reconectar ({self.reconnect_grace}s)...")
+        start = time.time()
+        attempt = 0
+        while time.time() - start < self.reconnect_grace:
+            attempt += 1
+            remaining = self.reconnect_grace - (time.time() - start)
+            try:
+                # Close stale handle
+                if self._ser and self._ser.is_open:
+                    try:
+                        self._ser.close()
+                    except Exception:
+                        pass
+                # Re-detect port (may have changed COM number)
+                port = detect_arduino_port() if self.serial_port.lower() == 'auto' else self.serial_port
+                if port:
+                    self._ser = serial.Serial()
+                    self._ser.port = port
+                    self._ser.baudrate = self.serial_baud
+                    self._ser.timeout = self.serial_timeout
+                    self._ser.open()
+                    self._resolved_port = port
+                    print(f"[CTRL] Reconectado en {port} (intento {attempt}, {remaining:.0f}s restantes)")
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        elapsed = time.time() - start
+        print(f"[CTRL] No se pudo reconectar en {elapsed:.0f}s ({attempt} intentos)")
+        return False
+
     def close(self):
-        """Por convención, siempre intentamos mandar 0 antes de cerrar."""
+        """Send stop command (0,0) and close the link."""
         try:
-            self.send(0)
+            self.send(0, 0)
             time.sleep(0.05)
         except Exception:
             pass
@@ -180,7 +417,7 @@ class ControlLink:
         if self.mode == 'serial':
             if self._ser and self._ser.is_open:
                 self._ser.close()
-                print("❎ [CTRL] Serial cerrado")
+                print(f"[CTRL] Serial cerrado ({self._resolved_port})")
         elif self.mode == 'wifi':
             if self._sock:
                 try:
@@ -188,9 +425,10 @@ class ControlLink:
                 except Exception:
                     pass
                 self._sock.close()
-                print("❎ [CTRL] Socket WiFi cerrado")
+                print("[CTRL] Socket WiFi cerrado")
         self._ser = None
         self._sock = None
+        self._resolved_port = None
 
 # Instancia global que configuramos en __main__ según la fuente
 control = None
@@ -199,59 +437,61 @@ control = None
 # ==========================
 #  CONFIGURA LLM (Manual/Auto)
 # ==========================
-def configure_llm_mode():
+def configure_llm_mode(choice="auto"):
     """
-    Selects between Local LLM (Ollama) and OpenAI Cloud.
-    Starts Ollama server automatically if needed.
+    Configures the LLM backend.
+    choice: "local" | "api" | "auto" (auto = detect Ollama, fallback to API)
     """
-    import subprocess
-    import shutil
-    
-    print("\nCheck LLM Configuration...")
-    
-    # 1. Check if we want to force local or cloud
-    # We default to LOCAL if Ollama is installed, otherwise CLOUD
+    if choice == "api":
+        # Force cloud API — clear any local overrides
+        os.environ.pop("OPENAI_BASE_URL", None)
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key or api_key == "ollama":
+            print("⚠️  OPENAI_API_KEY not set! Set it as an environment variable.")
+        else:
+            masked = api_key[:8] + "..." + api_key[-4:]
+            print(f"☁️  LLM: OpenAI Cloud API")
+            print(f"   Key:   {masked}")
+        os.environ.setdefault("OPENAI_MODEL", "gpt-4o-mini")
+        print(f"   Model: {os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')}")
+        return
+
+    if choice == "local":
+        force_local = True
+    else:
+        force_local = False
+
     ollama_path = shutil.which("ollama")
-    use_local = False
-    
-    if ollama_path:
-        print("✅ Ollama detected. Attempting to use Local LLM.")
-        use_local = True
-        
-        # Start server if not running
+
+    if ollama_path and (force_local or choice == "auto"):
+        print("✅ Ollama detected. Using Local LLM.")
         try:
-            # Check if server is running (simple check)
-            import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             result = sock.connect_ex(('127.0.0.1', 11434))
             sock.close()
-            
             if result != 0:
                 print("⏳ Starting Ollama server...")
-                subprocess.Popen(["ollama", "serve"], 
-                               creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-                time.sleep(3) # Give it a moment
-        except:
+                subprocess.Popen(["ollama", "serve"],
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                time.sleep(3)
+        except Exception:
             pass
-            
-        # Set config for Local
         os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
         os.environ["OPENAI_MODEL"] = "llama3.1"
         os.environ["OPENAI_API_KEY"] = "ollama"
-        
-        # Check if model exists, pull if not (non-blocking if possible, but we need it)
-        # We'll rely on the user having pulled it, or fallback to cloud if fails?
-        # For now, simplistic approach:
         print(f"✅ LLM: Local Ollama")
         print(f"   Model: {os.environ['OPENAI_MODEL']}")
         print(f"   URL:   {os.environ['OPENAI_BASE_URL']}")
-        
+    elif force_local:
+        print("❌ Ollama not found! Install from https://ollama.ai")
+        print("   Falling back to OpenAI Cloud API.")
+        configure_llm_mode("api")
     else:
-        print("⚠️ Ollama not found or disabled.")
-        print(f"☁️  LLM: OpenAI Cloud API (GPT-4o-mini)")
-        use_local = False
+        # auto with no Ollama => cloud
+        print("⚠️ Ollama not found.")
+        configure_llm_mode("api")
 
-configure_llm_mode()
+# Deferred — will be called from __main__ after user selects LLM mode
 
 #  CONFIG OPENAI / OBJETIVOS
 # ==========================
@@ -262,11 +502,21 @@ _model = os.environ.get("OPENAI_MODEL", getattr(Config.AI, 'OPENAI_MODEL', "gpt-
 
 client = OpenAI(api_key=_api_key, base_url=_base_url)
 
+def reinit_llm_client():
+    """Re-read env vars and rebuild the OpenAI client after user selects LLM mode."""
+    global _base_url, _api_key, _model, client
+    _base_url = os.environ.get("OPENAI_BASE_URL", getattr(Config.AI, 'OPENAI_BASE_URL', None))
+    _api_key = os.environ.get("OPENAI_API_KEY", getattr(Config.AI, 'OPENAI_API_KEY', None))
+    _model = os.environ.get("OPENAI_MODEL", getattr(Config.AI, 'OPENAI_MODEL', "gpt-4o-mini"))
+    client = OpenAI(api_key=_api_key, base_url=_base_url)
+
 # Navigation constants (from Config)
 DISTANCE_TARGET = getattr(Config.Navigation, 'DISTANCE_TARGET', 0.3)
 DIST_CORRECTION = getattr(Config.Navigation, 'DISTANCE_CORRECTION', 1.0)
 YOLO_CONF = getattr(Config.AI, 'YOLO_CONFIDENCE', 0.5)
-OBJECT_SEARCH_TIMEOUT = 1.0
+
+# Navigation speed safety mode (toggle with keybind)
+NAV_SAFE_MODE = False
 
 # ArUco marker constants
 ARUCO_MARKER_SIZE = getattr(Config.Vision, 'ARUCO_MARKER_SIZE', 0.20)
@@ -280,28 +530,14 @@ SMOOTH_WINDOW_SIZE = getattr(Config.Vision, 'SMOOTH_WINDOW_SIZE', 5)
 # Camera correction
 GAMMA_CORRECTION = getattr(Config.Vision, 'GAMMA_CORRECTION', 1.2)
 
-# Configuraciones por tipo de fuente (from Config)
-# Primary use case: DJI Spark via scrcpy (Android phone on DJI Controller)
+# Configuraciones por tipo de fuente — canonical definition in __main__,
+# this is a minimal fallback for when the module is imported by tests.
 if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
     SOURCE_CONFIGS = Config.Source.SOURCES
 else:
     SOURCE_CONFIGS = {
-        "default": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 5,
-            "target_fps": 30
-        },
-        "scrcpy": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 5,
-            "target_fps": 30
-        },
-        "stream": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval":1,
-            "target_fps": 10,
-            "url": "http://192.168.1.83/stream"
-        }
+        "default": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "wifi"},
+        "scrcpy": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "serial"},
     }
 
 # ==========================
@@ -448,7 +684,6 @@ except ImportError:
 # ==========================
 #  POSE-BASED DISTANCE ESTIMATION (Alternative to ArUco)
 # ==========================
-import math
 
 # Human body measurements (meters)
 TORSO_AVG_WIDTH_M = 0.40   # Average shoulder width (40cm)
@@ -900,15 +1135,15 @@ class VideoProcessor:
         self._cal_focal = None
         self._cal_width = None
         ai_config = getattr(Config, 'AI', None)
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+        cal_full_path = os.path.join(config_dir, self.calibration_file)
         if ai_config and hasattr(ai_config, 'get_focal_length'):
-            focal = ai_config.get_focal_length()
+            focal = ai_config.get_focal_length(calibration_file=cal_full_path)
             if focal is not None:
                 self._cal_focal = focal
                 # Also read the calibration resolution to enable proper scaling
                 try:
-                    config_dir = os.path.dirname(os.path.abspath(__file__))
-                    cal_path = os.path.join(config_dir, 'calibration', 'calINSPIRO.npz')
-                    cal_data = np.load(cal_path)
+                    cal_data = np.load(cal_full_path)
                     self._cal_width = int(cal_data.get('width', 1280))
                 except Exception:
                     self._cal_width = 1280  # default calibration resolution
@@ -1081,7 +1316,8 @@ class VideoProcessor:
                 print(f"[INFO] Frame dimensions: {w}x{h}, FOV: {self.fov_x:.1f}°x{self.fov_y:.1f}°")
         
         # Early return if no calibration (only needed for ArUco)
-        if self.use_aruco and (self.K is None or self.D is None):
+        # Early return only if ArUco is the SOLE detection mode and calibration is missing
+        if self.use_aruco and not self.use_pose_distance and (self.K is None or self.D is None):
             return
         
         # Undistort and enhance (only if using ArUco)
@@ -1204,12 +1440,12 @@ class VideoProcessor:
             self.object_classes = self.yolo.names
             print("✅ Modelo YOLO listo (YOLOv11 con ByteTrack)")
         
-        DET_RAD = 2.0
+        DET_RAD = DETECTION_RADIUS_SCALE
         # Use YOLO tracking with ByteTrack (built-in, more reliable than MOSSE)
         try:
-            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=0, persist=True)
-        except:
-            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device='cpu', persist=True)     
+            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=0, persist=True, classes=[0])
+        except Exception:
+            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device='cpu', persist=True, classes=[0])     
 
         dets = {}
         with self.lock:
@@ -1283,8 +1519,8 @@ class VideoProcessor:
             inf_device = 0 if self.pose_device == 'cuda' else 'cpu'
             use_half = (self.pose_device == 'cuda')  # FP16 on GPU = ~2x faster
             results = self.pose_model.track(
-                frame, conf=0.25, verbose=False, device=inf_device,
-                persist=True, imgsz=640, half=use_half
+                frame, conf=0.55, verbose=False, device=inf_device,
+                persist=True, imgsz=640, half=use_half, classes=[0]
             )
         except Exception as e:
             if not hasattr(self, '_pose_error_count'):
@@ -1320,8 +1556,10 @@ class VideoProcessor:
         # Build full keypoints array once (xy + conf) instead of per-person concatenate
         all_kpts = np.concatenate([kpts_xy, kpts_conf.reshape(kpts_conf.shape[0], -1, 1)], axis=2)
         
-        # Keep a raw (un-annotated) frame copy for face enrollment
-        self._raw_frame = frame.copy()
+        # Keep a raw (un-annotated) frame copy for face enrollment (thread-safe)
+        raw_copy = frame.copy()
+        with self.lock:
+            self._raw_frame = raw_copy
         
         seen_persons = set()
         
@@ -1684,7 +1922,9 @@ class VideoProcessor:
         active = self._get_active_markers()
         n_persons = sum(1 for m in active if isinstance(m, str) and m.startswith('person_'))
         device_str = 'GPU' if getattr(self, 'pose_device', '') == 'cuda' else 'CPU'
-        right_text = f"{n_persons}T | {device_str}"
+        global NAV_SAFE_MODE
+        safe_txt = "SAFE" if NAV_SAFE_MODE else "NORMAL"
+        right_text = f"{n_persons}T | {device_str} | {safe_txt}"
         cv2.putText(area, right_text, (w - len(right_text) * 8 - 8, h - 7), font, 0.40, (180, 180, 190), 1, LT)
 
     def _draw_system_log(self, area):
@@ -1771,9 +2011,10 @@ def open_port():
         raise RuntimeError("ControlLink no inicializado")
     try:
         control.open()
-        print(f"✅ Conexión abierta ({control.mode})")
+        port_info = control._resolved_port or control.wifi_ip
+        print(f"[CTRL] Conexion abierta ({control.mode}) -> {port_info}")
     except Exception as e:
-        print(f"❌ Error abriendo conexión: {e}")
+        print(f"[CTRL] Error abriendo conexion: {e}")
         raise
 
 def close_port():
@@ -1782,9 +2023,9 @@ def close_port():
         return
     try:
         control.close()
-        print(f"✅ Conexión cerrada ({control.mode})")
+        print(f"[CTRL] Conexion cerrada ({control.mode})")
     except Exception as e:
-        print(f"⚠️ Error cerrando conexión: {e}")
+        print(f"[CTRL] Error cerrando conexion: {e}")
 
 # ==========================
 #  IA PARA ELEGIR ID
@@ -1868,15 +2109,22 @@ Return JSON:"""
         _model = os.environ.get("OPENAI_MODEL", getattr(Config.AI, 'OPENAI_MODEL', "gpt-4o-mini"))
 
         async_client = AsyncOpenAI(api_key=_api_key, base_url=_base_url)
-        response = await async_client.chat.completions.create(
-            model=_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.1,
-            max_tokens=50
-        )
+        try:
+            response = await asyncio.wait_for(
+                async_client.chat.completions.create(
+                    model=_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    temperature=0.1,
+                    max_tokens=50,
+                    timeout=15
+                ),
+                timeout=20
+            )
+        finally:
+            await async_client.close()
         raw_answer = response.choices[0].message.content.strip()
         print(f"[LLM DEBUG] Raw response: '{raw_answer}'")
         if proc:
@@ -2039,63 +2287,122 @@ def format_detection_info(proc: VideoProcessor) -> str:
     return "\n".join(lines)
 
 # ==========================
-#  BYTES DE NAVEGACIÓN
+#  BYTES DE NAVEGACIÓN (2-byte Arduino protocol)
 # ==========================
-def send_commands_byte(d: dict, target: float):
-    # Calcula cada booleano (usando umbrales consistentes desde Config)
+def _angle_to_mag(angle, threshold):
+    """Map angle offset to level 0-3 with safe low-angle behavior.
+    Very low angles always use level 1 when movement is needed."""
+    a = abs(angle)
+    if a < threshold:
+        return 0
+    # Very low angles above threshold -> always slowest level
+    if a < max(threshold * 2.0, threshold + 4.0):
+        return 1
+    if a < threshold * 4.0:
+        return 2
+    return 3
+
+def _distance_to_mag(distance, target, fast_threshold):
+    """Map distance-to-target into forward level 0-3 with hard safety rule.
+    Under 10m, forward speed is ALWAYS level 1 (slowest), if moving forward."""
+    gap = distance - target
+    if gap <= 0:
+        return 0
+
+    # Hard safety requirement from user
+    if distance < 10.0:
+        return 1
+
+    # Above 10m scale progressively
+    if distance < 16.0:
+        return 2
+    return 3
+
+def _compute_nav_magnitudes(d: dict, target: float, safe_mode: bool = False):
+    """Compute per-axis magnitudes with distance/angle adaptive logic and safe caps."""
     ROTATION_THRESHOLD = getattr(Config.Navigation, 'ROTATION_THRESHOLD', 5)
     FAST_DISTANCE = getattr(Config.Navigation, 'FAST_SPEED_THRESHOLD', 1.0)
-    
-    rotate_ccw = d['angle_x'] <= -ROTATION_THRESHOLD
-    rotate_cw  = d['angle_x'] >= +ROTATION_THRESHOLD
-    up         = False  # No usado en navegación horizontal
-    down       = False  # No usado en navegación horizontal
-    forward    = d['distance'] > target  # Avanzar si está lejos del objetivo
-    takeoff    = False  # No usado en navegación automática
-    fastFwd    = d['distance'] >= FAST_DISTANCE  # Velocidad rápida si está muy lejos
-    allFast    = False  # No usado
+    VERTICAL_THRESHOLD = getattr(Config.Navigation, 'ROTATION_THRESHOLD', 5)
 
-    # Empaqueta en un byte
-    b = (
-        (rotate_ccw << 0) |
-        (rotate_cw  << 1) |
-        (up         << 2) |
-        (down       << 3) |
-        (forward    << 4) |
-        (takeoff    << 5) |
-        (fastFwd    << 6) |
-        (allFast    << 7)
+    ax = d['angle_x']
+    ay = d['angle_y']
+    dist = d['distance']
+
+    # Rotation
+    rot_mag = _angle_to_mag(ax, ROTATION_THRESHOLD)
+    ccw_mag = rot_mag if ax <= -ROTATION_THRESHOLD else 0
+    cw_mag  = rot_mag if ax >= +ROTATION_THRESHOLD else 0
+
+    # Vertical
+    vert_mag = _angle_to_mag(ay, VERTICAL_THRESHOLD)
+    up_mag   = vert_mag if ay >= +VERTICAL_THRESHOLD else 0
+    down_mag = vert_mag if ay <= -VERTICAL_THRESHOLD else 0
+
+    # Forward/backward
+    fwd_mag = _distance_to_mag(dist, target, FAST_DISTANCE)
+    bwd_mag = 0
+
+    # Global safety mode: cap every non-zero command to slowest level
+    if safe_mode:
+        ccw_mag = 1 if ccw_mag > 0 else 0
+        cw_mag = 1 if cw_mag > 0 else 0
+        up_mag = 1 if up_mag > 0 else 0
+        down_mag = 1 if down_mag > 0 else 0
+        fwd_mag = 1 if fwd_mag > 0 else 0
+
+    return {
+        'ccw': ccw_mag,
+        'cw': cw_mag,
+        'up': up_mag,
+        'down': down_mag,
+        'fwd': fwd_mag,
+        'bwd': bwd_mag,
+    }
+
+def send_commands_byte(d: dict, target: float):
+    """Compute navigation magnitudes and send 2-byte Arduino command."""
+    global NAV_SAFE_MODE
+    mags = _compute_nav_magnitudes(d, target, safe_mode=NAV_SAFE_MODE)
+    b1, b2 = encode_arduino_pair(
+        ccw=mags['ccw'], cw=mags['cw'], up=mags['up'],
+        down=mags['down'], fwd=mags['fwd'], bwd=mags['bwd']
     )
-    # Enviar por el medio configurado (serial o wifi)
-    control.send(b)
+    control.send(b1, b2)
+
+_MAG_LABELS = ['---', 'LOW', 'MED', 'MAX']
 
 def print_navigation_commands(d: dict, target: float, follow: bool = False):
-    """Muestra los comandos de forma más clara"""
-    ROTATION_THRESHOLD = getattr(Config.Navigation, 'ROTATION_THRESHOLD', 5)
-    FAST_DISTANCE = getattr(Config.Navigation, 'FAST_SPEED_THRESHOLD', 1.0)
-    
-    header = "📍 SEGUIMIENTO ACTIVO" if follow else "🎯 OBJETIVO FIJO"
-    
-    # Calcular comandos reales
-    rotate_ccw = d['angle_x'] <= -ROTATION_THRESHOLD
-    rotate_cw = d['angle_x'] >= +ROTATION_THRESHOLD
-    forward = d['distance'] > target
-    fast_speed = d['distance'] >= FAST_DISTANCE
-    
+    """Display navigation commands with magnitude levels."""
+    ax = d['angle_x']
+    ay = d['angle_y']
+    dist = d['distance']
+    header = "SEGUIMIENTO" if follow else "OBJETIVO FIJO"
+
+    global NAV_SAFE_MODE
+    mags = _compute_nav_magnitudes(d, target, safe_mode=NAV_SAFE_MODE)
+    ccw = mags['ccw']
+    cw = mags['cw']
+    up_m = mags['up']
+    dn_m = mags['down']
+    fwd = mags['fwd']
+
+    gap_str = f"{dist - target:.2f}m restantes" if fwd > 0 else "EN POSICION"
+    mode_str = "MODO SEGURO: ON" if NAV_SAFE_MODE else "MODO SEGURO: OFF"
+
     return "\n".join([
         "",
         "===============================",
         f"{header} [ID {d.get('id', '?')}]",
         "===============================",
-        f"Distancia: {d['distance']:.2f}m (target: {target:.2f}m)",
-        f"Dirección: X:{d['angle_x']:+.1f}° Y:{d['angle_y']:+.1f}°",
+        f"Dist: {dist:.2f}m (target: {target:.2f}m)",
+        f"Dir:  X:{ax:+.1f} Y:{ay:+.1f}",
         "",
-        "COMANDOS ACTIVOS:",
-        f"   ➡️  Rotar izquierda:   {'SÍ' if rotate_ccw else 'NO'}",
-        f"   ⬅️  Rotar derecha:     {'SÍ' if rotate_cw else 'NO'}",
-        f"   ⬆️  Avanzar:           {'SÍ' if forward else 'NO'}",
-        f"   ⚡  Velocidad rápida:  {'SÍ' if fast_speed else 'NO'}",
-        f"   🎯 Estado: {'ACERCANDO ({:.2f}m restantes)'.format(d['distance'] - target) if forward else 'EN POSICIÓN'}",
+        "SERVOS:",
+        f"  ROT  CCW:{_MAG_LABELS[ccw]}  CW:{_MAG_LABELS[cw]}",
+        f"  TILT UP:{_MAG_LABELS[up_m]}  DN:{_MAG_LABELS[dn_m]}",
+        f"  FWD  {_MAG_LABELS[fwd]}",
+        f"  -> {gap_str}",
+        f"  {mode_str}",
         "===============================",
         "",
     ])
@@ -2169,6 +2476,83 @@ ENROLL_RE = re.compile(
     r'(.+)',
     re.IGNORECASE
 )
+
+# Flexible enrollment matcher (no ID required):
+# "save a person as Basaldua", "guardar persona como Juan", "save as Yoyo"
+ENROLL_FLEX_RE = re.compile(
+    r'(?:save|add|guardar|registrar|remember|name|nombrar)\s+'
+    r'(?:(?:a|an|una|un)\s+)?'
+    r'(?:(?:person[a]?|persona)(?:[_\s]?(\d+))?)?\s*'
+    r'(?:as|como|=)\s+'
+    r'(.+)',
+    re.IGNORECASE
+)
+
+ENROLL_INTENT_VERB_RE = re.compile(
+    r'\b(?:save|add|enroll|register|remember|name|store|'
+    r'guardar|agregar|añadir|anadir|registrar|nombrar|memoriza|guardarle)\b',
+    re.IGNORECASE
+)
+
+ENROLL_TARGET_HINT_RE = re.compile(
+    r'\b(?:face|cara|rostro|person|persona|id\s*\d+)\b',
+    re.IGNORECASE
+)
+
+def _extract_enroll_name(command: str) -> str:
+    """Extract enrollment name from command using several natural-language patterns."""
+    cmd = command.strip()
+    patterns = [
+        r'(?:as|como|=)\s*["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40})["\']?\s*$',
+        r'(?:named|name\s+it|llamad[oa]|se\s+llama)\s+["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40})["\']?\s*$',
+        r'^(?:save|add|enroll|register|name|store|guardar|agregar|añadir|anadir|registrar|nombrar)\s+'
+        r'(?:a\s+|an\s+|una\s+|un\s+)?(?:person[a]?|persona|face|cara|rostro)?\s*'
+        r'["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40})["\']?\s*$',
+    ]
+    for pat in patterns:
+        m = re.search(pat, cmd, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            # reject obvious non-name tokens
+            bad = {
+                'person', 'persona', 'face', 'cara', 'rostro', 'id',
+                'as', 'como', 'save', 'add', 'enroll', 'register',
+                'guardar', 'agregar', 'añadir', 'anadir', 'nombrar'
+            }
+            if candidate.lower() not in bad and len(candidate) >= 2:
+                return candidate
+    return ''
+
+def detect_enrollment_intent(command: str):
+    """Detect if user intends to enroll/save a face and extract target info.
+
+    Returns:
+      None if not enrollment intent
+      dict with keys: {'person_num': str|None, 'target_name': str|None, 'reason': str}
+    """
+    cmd = command.strip()
+    if not cmd:
+        return None
+
+    has_enroll_verb = bool(ENROLL_INTENT_VERB_RE.search(cmd))
+    explicit_as_form = bool(re.search(r'\b(?:as|como|=)\b', cmd, re.IGNORECASE))
+    has_target_hint = bool(ENROLL_TARGET_HINT_RE.search(cmd))
+
+    # Enrollment intent if user uses enrollment verbs and any reasonable target syntax
+    if not (has_enroll_verb and (explicit_as_form or has_target_hint or len(cmd.split()) <= 6)):
+        return None
+
+    person_num = None
+    pm = re.search(r'\b(?:person[a]?|id)[_\s\-]?(\d+)\b', cmd, re.IGNORECASE)
+    if pm:
+        person_num = pm.group(1)
+
+    target_name = _extract_enroll_name(cmd)
+    return {
+        'person_num': person_num,
+        'target_name': target_name if target_name else None,
+        'reason': 'enroll_intent_detected'
+    }
 
 # Matches: "remove Yoyo", "delete Maria", "borrar Juan", "eliminar persona Maria"
 REMOVE_FACE_RE = re.compile(
@@ -2260,20 +2644,70 @@ def prompt_thread(proc):
                 proc.cmd_console.add_output("⚠️ Enrollment cancelled (new command).")
                 # Fall through to process the new command normally
 
-        # ─── Check for enrollment command ───────────────────────────
+        # ─── Check for enrollment command/intention (robust parser) ─
         enroll_match = ENROLL_RE.match(last_command)
-        if enroll_match and proc.face_system:
-            person_num = enroll_match.group(1)
-            target_name = enroll_match.group(2).strip()
-            person_id = f"person_{person_num}"
-            
+        enroll_flex_match = ENROLL_FLEX_RE.match(last_command)
+        enroll_intent = detect_enrollment_intent(last_command)
+        if enroll_match or enroll_flex_match or enroll_intent:
+            if not proc.face_system:
+                proc.cmd_console.add_output("❌ Face recognition not loaded. No se puede guardar rostro.")
+                continue
+
+            # Extract target name and optional person number
+            if enroll_match:
+                person_num = enroll_match.group(1)
+                target_name = enroll_match.group(2).strip()
+            else:
+                if enroll_flex_match:
+                    person_num = enroll_flex_match.group(1)
+                    target_name = enroll_flex_match.group(2).strip()
+                else:
+                    person_num = enroll_intent.get('person_num')
+                    target_name = (enroll_intent.get('target_name') or '').strip()
+
+            if not target_name:
+                proc.cmd_console.add_output(
+                    "❌ Entendí que quieres guardar una persona, pero faltó el nombre.\n"
+                    "   Ejemplos: 'save person 1 as Basaldua' o 'save a person as Basaldua'"
+                )
+                continue
+
+            # Resolve person ID:
+            # 1) explicit person number in command
+            # 2) if exactly one active person, use it automatically
+            # 3) otherwise ask user to be specific and STOP (do not navigate)
+            person_id = None
+            if person_num:
+                person_id = f"person_{person_num}"
+            else:
+                with proc.lock:
+                    active_people = [
+                        pid for pid in proc.history.keys()
+                        if isinstance(pid, str) and pid.startswith('person_')
+                        and (time.time() - proc.history[pid].get('last_seen', 0) <= proc.expire_time)
+                    ]
+
+                if len(active_people) == 1:
+                    person_id = active_people[0]
+                    proc.cmd_console.add_output(f"ℹ️ Enrollment sin ID explícito: usando {person_id}")
+                elif len(active_people) == 0:
+                    proc.cmd_console.add_output("❌ No hay personas activas visibles para guardar rostro.")
+                    continue
+                else:
+                    options = ', '.join(active_people)
+                    proc.cmd_console.add_output(
+                        f"⚠️ Hay múltiples personas activas ({options}).\n"
+                        f"   Usa: save person N as {target_name}"
+                    )
+                    continue
+
             with proc.lock:
                 person_exists = person_id in proc.history
-            
+
             if not person_exists:
                 proc.cmd_console.add_output(f"❌ {person_id} not found. Make sure they're visible.")
                 continue
-            
+
             proc.pending_enrollment = {
                 'person_id': person_id,
                 'name': target_name,
@@ -2496,23 +2930,43 @@ def prompt_thread(proc):
 # ==========================
 #  CAPTURAS
 # ==========================
-def capture_scrcpy_window():
-    """Capture the scrcpy window showing DJI GO 4 from the Android phone."""
+
+# Hardcoded scrcpy capture resolution — aligned to calibration/calINSPIRO.npz
+SCRCPY_WIDTH  = 2340
+SCRCPY_HEIGHT = 1080
+
+# PrintWindow flags — capture window content even when behind other windows
+PW_CLIENTONLY = 1           # Capture client area only (no title bar)
+PW_RENDERFULLCONTENT = 2    # Force full DWM render (Windows 8.1+)
+
+def capture_window_by_title(title_hint):
+    """Capture any window by partial title match (for Smart View, scrcpy, etc)."""
+    if not SCRCPY_AVAILABLE:
+        return None
     try:
-        hwnd = win32gui.FindWindow(None, "scrcpy")
+        # Find window by exact or partial title
+        hwnd = win32gui.FindWindow(None, title_hint)
         if not hwnd:
-            raise Exception(
-                'scrcpy window not found — run launch_scrcpy_wireless.bat first'
-            )
+            # Search all windows for partial match
+            def enum_callback(h, results):
+                if win32gui.IsWindowVisible(h):
+                    t = win32gui.GetWindowText(h)
+                    if t and title_hint.lower() in t.lower():
+                        results.append(h)
+            results = []
+            win32gui.EnumWindows(enum_callback, results)
+            if results:
+                hwnd = results[0]
+            else:
+                return None
 
         left_c, top_c, right_c, bottom_c = win32gui.GetClientRect(hwnd)
         width  = right_c  - left_c
         height = bottom_c - top_c
+        if width <= 0 or height <= 0:
+            return None
 
-        top_left = win32gui.ClientToScreen(hwnd, (left_c, top_c))
-        x, y = top_left
-
-        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        hwnd_dc = win32gui.GetDC(hwnd)
         mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
         save_dc = mfc_dc.CreateCompatibleDC()
 
@@ -2520,13 +2974,11 @@ def capture_scrcpy_window():
         save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
         save_dc.SelectObject(save_bitmap)
 
-        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (x, y), win32con.SRCCOPY)
+        # PrintWindow — works even when window is behind other windows
+        ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_CLIENTONLY | PW_RENDERFULLCONTENT)
 
-        bmpinfo = save_bitmap.GetInfo()
         bmpstr  = save_bitmap.GetBitmapBits(True)
-        # Usar reshape in-place es más rápido
         img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4)
-        # cvtColor más rápido con flags optimizadas
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
         win32gui.DeleteObject(save_bitmap.GetHandle())
@@ -2535,15 +2987,134 @@ def capture_scrcpy_window():
         win32gui.ReleaseDC(hwnd, hwnd_dc)
 
         return img
-
     except Exception as e:
-        print(f"Scrcpy capture error: {e}")
         return None
 
-def capture_thread(src, frame_q, proc):
-    source_type = "default"
+def capture_scrcpy_window():
+    """Capture the scrcpy window client area using PrintWindow.
+    Works even when scrcpy is behind other windows (no lag when occluded)."""
+    try:
+        hwnd = win32gui.FindWindow(None, "scrcpy")
+        if not hwnd:
+            return None
+
+        # Get client area dimensions (DPI-aware thanks to SetProcessDpiAwareness)
+        left_c, top_c, right_c, bottom_c = win32gui.GetClientRect(hwnd)
+        width  = right_c  - left_c
+        height = bottom_c - top_c
+        if width <= 0 or height <= 0:
+            return None
+
+        # Use GetDC (client-area DC) — NOT GetWindowDC which includes title bar/borders
+        hwnd_dc = win32gui.GetDC(hwnd)
+        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+
+        save_bitmap = win32ui.CreateBitmap()
+        save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(save_bitmap)
+
+        # PrintWindow captures the actual window content regardless of Z-order
+        # PW_CLIENTONLY | PW_RENDERFULLCONTENT = capture client area with DWM compositing
+        ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_CLIENTONLY | PW_RENDERFULLCONTENT)
+
+        bmpstr  = save_bitmap.GetBitmapBits(True)
+        img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4)
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        win32gui.DeleteObject(save_bitmap.GetHandle())
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+        # Always output exact hardcoded resolution
+        if width != SCRCPY_WIDTH or height != SCRCPY_HEIGHT:
+            img = cv2.resize(img, (SCRCPY_WIDTH, SCRCPY_HEIGHT))
+
+        return img
+
+    except Exception as e:
+        return None
+
+def capture_thread(src, frame_q, proc, source_type="default"):
     
-    if src == "scrcpy":
+    if src == "smartview":
+        source_type = "smartview"
+        if not SCRCPY_AVAILABLE:
+            proc.cmd_console.add_output("Error: pywin32 required for Smart View capture")
+            proc.stop_event.set()
+            return
+        
+        config = SOURCE_CONFIGS[source_type]
+        proc.frame_time = 1.0 / config["target_fps"]
+        
+        # Window title hints to search for (Connect app / Conectar / phone name)
+        title_hints = ["Connect", "Conectar", "Wireless Display", "Galaxy", "SM-S928"]
+        
+        proc.cmd_console.add_output("=== Smart View / Miracast ===")
+        proc.cmd_console.add_output("1. Abre 'Conectar' en Windows (buscar 'Connect' en Inicio)")
+        proc.cmd_console.add_output("2. En tu S24: desliza abajo > Smart View > selecciona tu PC")
+        proc.cmd_console.add_output("3. Esperando ventana de transmision...")
+        
+        found_title = None
+        wait_start = time.time()
+        
+        # Wait up to 60 seconds for the Miracast window to appear
+        while not proc.stop_event.is_set() and (time.time() - wait_start) < 60:
+            for hint in title_hints:
+                test_frame = capture_window_by_title(hint)
+                if test_frame is not None:
+                    found_title = hint
+                    break
+            if found_title:
+                break
+            time.sleep(1)
+        
+        if not found_title:
+            proc.cmd_console.add_output("No se detecto ventana Smart View en 60s")
+            proc.cmd_console.add_output("Asegurate de que la app 'Conectar' esta abierta")
+            proc.stop_event.set()
+            return
+        
+        proc.cmd_console.add_output(f"Smart View detectado (ventana: '{found_title}')")
+        proc.cmd_console.add_output("Capturando pantalla...")
+        
+        no_frame_count = 0
+        while not proc.stop_event.is_set():
+            target = time.time() + proc.frame_time
+            frame = capture_window_by_title(found_title)
+            if frame is not None:
+                no_frame_count = 0
+                try:
+                    frame_q.put_nowait(frame)
+                except Full:
+                    try:
+                        frame_q.get_nowait()
+                        frame_q.put_nowait(frame)
+                    except Empty:
+                        pass
+            else:
+                no_frame_count += 1
+                if no_frame_count > 30:
+                    proc.cmd_console.add_output("Smart View window lost. Reconnecting...")
+                    found_again = False
+                    for hint in title_hints:
+                        if capture_window_by_title(hint) is not None:
+                            found_title = hint
+                            found_again = True
+                            no_frame_count = 0
+                            proc.cmd_console.add_output(f"Reconectado: '{hint}'")
+                            break
+                    if not found_again:
+                        proc.cmd_console.add_output("Smart View perdido. Deteniendose.")
+                        proc.stop_event.set()
+                        return
+            
+            sleep_time = target - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    
+    elif src == "scrcpy":
         source_type = "scrcpy"
         if not SCRCPY_AVAILABLE:
             proc.cmd_console.add_output("Error: pywin32 package required for scrcpy capture")
@@ -2575,42 +3146,120 @@ def capture_thread(src, frame_q, proc):
     elif src == "stream" or src.startswith("http"):
         stream_url = SOURCE_CONFIGS["stream"]["url"] if src == "stream" else src
         
-        proc.cmd_console.add_output(f"Usando stream HTTP: {stream_url}")
-        
-        cap = cv2.VideoCapture(stream_url)
-        
-        if not cap.isOpened():
-            proc.cmd_console.add_output("Error: No se puede abrir el stream")
-            proc.stop_event.set()
-            return
-        
-        config = SOURCE_CONFIGS["stream"]
+        # Use phone_stream config if that's the source type, otherwise stream
+        stream_config_key = source_type if source_type in SOURCE_CONFIGS else "stream"
+        config = SOURCE_CONFIGS[stream_config_key]
         fps = config["target_fps"]
         proc.frame_time = 1.0 / fps
         
-        proc.cmd_console.add_output(f"Stream FPS objetivo: {fps}")
+        proc.cmd_console.add_output(f"Stream: {stream_url}")
+        proc.cmd_console.add_output(f"Target FPS: {fps}")
         
-        while not proc.stop_event.is_set() and cap.isOpened():
-            ret, frame = cap.read()
+        # Use raw HTTP MJPEG reader for phone_stream (much more reliable than cv2.VideoCapture)
+        if "mjpeg" in stream_url.lower() or source_type == "phone_stream":
+            import urllib.request
             
-            if not ret:
-                proc.cmd_console.add_output("Error: No se puede recibir el frame (Stream terminado?)")
-                time.sleep(1)
-                continue
+            proc.cmd_console.add_output("Using direct MJPEG reader (low latency)")
             
-            if proc.frame_width and proc.frame_height:
-                if frame.shape[1] != proc.frame_width or frame.shape[0] != proc.frame_height:
-                    frame = cv2.resize(frame, (proc.frame_width, proc.frame_height))
+            stream = None
+            reconnect_attempts = 0
             
-            try:
-                if frame_q.full():
-                    frame_q.get_nowait()
-                frame_q.put_nowait(frame)
-            except Full:
-                continue
-            # No sleep — cap.read() already blocks until a frame is available
+            while not proc.stop_event.is_set():
+                # Connect / reconnect
+                if stream is None:
+                    try:
+                        req = urllib.request.Request(stream_url)
+                        stream = urllib.request.urlopen(req, timeout=10)
+                        reconnect_attempts = 0
+                        proc.cmd_console.add_output("MJPEG stream connected")
+                    except Exception as e:
+                        reconnect_attempts += 1
+                        if reconnect_attempts <= 5:
+                            proc.cmd_console.add_output(f"Stream connect failed ({reconnect_attempts}/5): {e}")
+                            time.sleep(2)
+                            continue
+                        else:
+                            proc.cmd_console.add_output("Stream connection failed. Giving up.")
+                            proc.stop_event.set()
+                            return
+                
+                # Read MJPEG frame by finding JPEG boundaries (FFD8 start, FFD9 end)
+                try:
+                    buf = b''
+                    while not proc.stop_event.is_set():
+                        chunk = stream.read(4096)
+                        if not chunk:
+                            proc.cmd_console.add_output("Stream ended, reconnecting...")
+                            stream = None
+                            break
+                        
+                        buf += chunk
+                        
+                        # Find JPEG start and end markers
+                        start = buf.find(b'\xff\xd8')
+                        end = buf.find(b'\xff\xd9', start + 2) if start != -1 else -1
+                        
+                        if start != -1 and end != -1:
+                            jpg_data = buf[start:end + 2]
+                            buf = buf[end + 2:]  # Keep remainder for next frame
+                            
+                            # Decode JPEG
+                            img_array = np.frombuffer(jpg_data, dtype=np.uint8)
+                            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                            
+                            if frame is not None:
+                                if proc.frame_width and proc.frame_height:
+                                    if frame.shape[1] != proc.frame_width or frame.shape[0] != proc.frame_height:
+                                        frame = cv2.resize(frame, (proc.frame_width, proc.frame_height))
+                                
+                                try:
+                                    if frame_q.full():
+                                        frame_q.get_nowait()
+                                    frame_q.put_nowait(frame)
+                                except (Full, Empty):
+                                    pass
+                            
+                            # Prevent buffer from growing unbounded
+                            if len(buf) > 100000:
+                                last_start = buf.rfind(b'\xff\xd8')
+                                if last_start > 0:
+                                    buf = buf[last_start:]
+                                else:
+                                    buf = b''
+                                    
+                except Exception as e:
+                    proc.cmd_console.add_output(f"Stream read error: {e}")
+                    stream = None
+                    time.sleep(1)
+        else:
+            # Standard OpenCV VideoCapture for non-MJPEG streams
+            cap = cv2.VideoCapture(stream_url)
+            if not cap.isOpened():
+                proc.cmd_console.add_output("Error: Cannot open stream")
+                proc.stop_event.set()
+                return
             
-        cap.release()
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            while not proc.stop_event.is_set() and cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    proc.cmd_console.add_output("Stream frame error, retrying...")
+                    time.sleep(1)
+                    continue
+                
+                if proc.frame_width and proc.frame_height:
+                    if frame.shape[1] != proc.frame_width or frame.shape[0] != proc.frame_height:
+                        frame = cv2.resize(frame, (proc.frame_width, proc.frame_height))
+                
+                try:
+                    if frame_q.full():
+                        frame_q.get_nowait()
+                    frame_q.put_nowait(frame)
+                except Full:
+                    continue
+            
+            cap.release()
     else:
         try:
             src_idx = int(src) if src else 0
@@ -2721,7 +3370,7 @@ def display_thread(proc):
     delay = 1  # Minimal waitKey delay — render as fast as possible
     
     cv2.namedWindow('SIGO', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.resizeWindow('SIGO', 1280, 720)
+    cv2.resizeWindow('SIGO', SCRCPY_WIDTH, SCRCPY_HEIGHT)
     cv2.setWindowProperty('SIGO', cv2.WND_PROP_TOPMOST, 0)
     
     last_frame_time = time.time()
@@ -2793,11 +3442,13 @@ def display_thread(proc):
                     if proc.face_system is None:
                         proc.cmd_console.add_output("🔄 Loading face recognition (ArcFace)...")
                         try:
+                            db_dir = resolve_face_database_dir()
                             proc.face_system = LiveFaceRecognition(
-                                database_dir=getattr(Config.AI, 'FACE_DATABASE_DIR', 'face_database')
+                                database_dir=db_dir
                             )
                             people = proc.face_system.list_people()
                             proc.cmd_console.add_output(f"✅ Face recognition ON ({len(people)} enrolled)")
+                            proc.cmd_console.add_output(f"   DB: {db_dir}")
                         except Exception as e:
                             proc.cmd_console.add_output(f"❌ Face recognition error: {e}")
                             proc.face_recognition_enabled = False
@@ -2808,6 +3459,13 @@ def display_thread(proc):
                     proc.cmd_console.add_output("⏸️ Face recognition OFF")
             else:
                 proc.cmd_console.add_output("❌ Face recognition unavailable (onnxruntime + ArcFace model required)")
+        elif key == Config.Keybinds.KEY_SAFE_MODE:
+            global NAV_SAFE_MODE
+            NAV_SAFE_MODE = not NAV_SAFE_MODE
+            if NAV_SAFE_MODE:
+                proc.cmd_console.add_output("🛡️ Modo Seguro ACTIVADO — velocidades más lentas")
+            else:
+                proc.cmd_console.add_output("⚙️ Modo Seguro DESACTIVADO — velocidades adaptativas")
         elif key in Config.Keybinds.KEY_ARROW_PREFIX:
             key2 = cv2.waitKey(1) & 0xFF
             if key2 == Config.Keybinds.KEY_ARROW_UP:
@@ -2820,6 +3478,7 @@ def display_thread(proc):
                 ord(Config.Keybinds.KEY_VOICE_RECORD),      # 3
                 Config.Keybinds.KEY_FACE_RECOGNITION,        # 4
                 ord(Config.Keybinds.KEY_CANCEL_NAV),         # 5
+                Config.Keybinds.KEY_SAFE_MODE,               # 6
                 ord(Config.Keybinds.KEY_MANUAL_TOGGLE),      # 7
             }
             if key not in hotkey_codes:
@@ -2830,44 +3489,71 @@ def display_thread(proc):
 # ==========================
 #  MODO MANUAL
 # ==========================
+# Keys that map to each Arduino channel (order matches Arduino bit layout)
+_MANUAL_CHANNEL_KEYS = [
+    'MANUAL_ROTATE_CCW',   # channel 0: CCW
+    'MANUAL_ROTATE_CW',    # channel 1: CW
+    'MANUAL_UP',           # channel 2: Up
+    'MANUAL_DOWN',         # channel 3: Down
+    'MANUAL_FORWARD',      # channel 4: Forward
+    'MANUAL_BACK',         # channel 5: Backward
+]
+
 def manual_control_loop(proc: VideoProcessor):
     """
-    Bucle de control manual: teclas configurables en config.py
-    Envía el byte cada 500 ms (incluso si es 0). Sale con KEY_MANUAL_EXIT o cuando se desactiva manual_mode.
+    Manual control loop: sends 2-byte Arduino commands.
+    Each direction key = magnitude 1 (light). Hold FAST key = magnitude 3 (strong).
+    Sends every 500ms. Exit with KEY_MANUAL_EXIT.
     """
     try:
         open_port()
 
-        KEY_BIT = Config.Keybinds.get_manual_key_bits()
+        # Resolve key names to actual key strings from config
+        channel_keys = []
+        for attr in _MANUAL_CHANNEL_KEYS:
+            channel_keys.append(getattr(Config.Keybinds, attr, None))
+        fast_key = getattr(Config.Keybinds, 'MANUAL_FAST', 'f')
 
-        prev_states = {k: False for k in KEY_BIT}
+        prev_states = {k: False for k in channel_keys if k}
+        prev_states[fast_key] = False
         last_send = time.time()
 
         while not proc.stop_event.is_set():
             with proc.manual_mode_lock:
                 if not proc.manual_mode:
                     break
-            # salir con KEY_MANUAL_EXIT
             if keyboard.is_pressed(Config.Keybinds.KEY_MANUAL_EXIT):
-                proc.console.add_output(f"[MANUAL] tecla {Config.Keybinds.KEY_MANUAL_EXIT} PRESIONADA → saliendo")
+                proc.console.add_output(f"[MANUAL] tecla {Config.Keybinds.KEY_MANUAL_EXIT} PRESIONADA -> saliendo")
                 break
 
-            curr_states = {k: keyboard.is_pressed(k) for k in KEY_BIT}
+            all_keys = list(set(k for k in channel_keys if k)) + [fast_key]
+            curr_states = {k: keyboard.is_pressed(k) for k in all_keys}
 
             for k, curr in curr_states.items():
-                if curr != prev_states[k]:
+                if k in prev_states and curr != prev_states[k]:
                     estado = "PRESIONADA" if curr else "LIBERADA"
                     proc.console.add_output(f"[MANUAL] tecla {k.upper()} {estado}")
-            prev_states = curr_states
+            prev_states = dict(curr_states)
 
             if time.time() - last_send >= 0.5:
-                byte = 0
-                for k, bit in KEY_BIT.items():
-                    if curr_states[k]:
-                        byte |= bit
+                is_fast = curr_states.get(fast_key, False)
+                mags = []
+                for ck in channel_keys:
+                    if ck and curr_states.get(ck, False):
+                        mags.append(3 if is_fast else 1)
+                    else:
+                        mags.append(0)
 
-                control.send(byte)
-                proc.console.add_output(f"[MANUAL] enviado byte: {byte:08b}")
+                b1, b2 = encode_arduino_pair(
+                    ccw=mags[0], cw=mags[1], up=mags[2],
+                    down=mags[3], fwd=mags[4], bwd=mags[5]
+                )
+                control.send(b1, b2)
+                active = [_MANUAL_CHANNEL_KEYS[i].split('_',1)[1]
+                          for i in range(6) if mags[i] > 0]
+                label = ', '.join(active) if active else 'STOP'
+                speed = 'FAST' if is_fast and active else ''
+                proc.console.add_output(f"[MANUAL] {label} {speed}  b1={b1:06b} b2={b2:06b}")
                 last_send = time.time()
 
             time.sleep(0.01)
@@ -2895,13 +3581,29 @@ if __name__ == '__main__':
             "calibration": "calibration/calINSPIRO.npz",
             "detection_interval": 5,
             "target_fps": 30,
-            "control": "wifi"   # cámara local → WiFi
+            "control": "wifi"   # cámara local -> WiFi
         },
         "scrcpy": {
             "calibration": "calibration/calINSPIRO.npz",
             "detection_interval": 5,
             "target_fps": 30,
-            "control": "serial"   # DJI Controller → Serial
+            "width": 2340,
+            "height": 1080,
+            "control": "serial"   # DJI Controller -> Serial
+        },
+        "smartview": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 3,
+            "target_fps": 30,
+            "control": "serial"   # DJI Controller -> Serial
+        },
+        "phone_stream": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 2,
+            "target_fps": 20,
+            "port": 8080,
+            "path": "/stream.mjpeg",
+            "control": "serial"   # DJI Controller -> Serial
         },
         "stream": {
             "calibration": "calibration/calINSPIRO.npz",
@@ -2912,26 +3614,82 @@ if __name__ == '__main__':
         }
     }
 
+
+    # Solicitar modo LLM (ANTES de calibración)
+    print("\nSelecciona el modelo de lenguaje (LLM):")
+    print("1 - Local (Ollama) [default if installed]")
+    print("2 - API Key (OpenAI Cloud)")
+    llm_choice = input("Opcion [1-2] (Enter = auto): ").strip()
+
+    if llm_choice == "1":
+        configure_llm_mode("local")
+    elif llm_choice == "2":
+        configure_llm_mode("api")
+    else:
+        configure_llm_mode("auto")
+
+    # Re-initialize client with the selected LLM settings
+    reinit_llm_client()
+    print("")
+
+    # Solicitar tipo de calibración (ANTES de la fuente)
+    print("Selecciona la calibración de cámara:")
+    print("1 - Standard (calINSPIRO.npz) [default]")
+    print("2 - PhCam (Samsung S24 Standard @ 2340x1080)")
+    cal_choice = input("Opcion [1-2] (Enter = 1): ").strip()
+
+    if cal_choice == "2":
+        selected_cal_file = "calibration/calS24.npz"
+        print(">> Usando calibración: PhCam (Samsung S24)")
+    else:
+        selected_cal_file = "calibration/calINSPIRO.npz"
+        print(">> Usando calibración: Standard (calINSPIRO)")
+
+    # Aplicar la calibración seleccionada a TODAS las configuraciones de fuente
+    for key in SOURCE_CONFIGS:
+        if "calibration" in SOURCE_CONFIGS[key]:
+            SOURCE_CONFIGS[key]["calibration"] = selected_cal_file
+
     # Solicitar tipo de fuente
-    print("Selecciona la fuente de video:")
-    print("1 - Scrcpy (DJI Spark via Android)  [default]")
-    print("2 - Cámara local (webcam)")
-    print(f"3 - Stream HTTP ({CamIP})")
-    print("4 - Especificar URL personalizada")
+    print("\nSelecciona la fuente de video:")
+    print("1 - Scrcpy (DJI Spark via Android - recommended)  [default]")
+    print("2 - Phone Stream MJPEG (DJI Spark)")
+    print("3 - Camara local (webcam)")
+    print(f"4 - Stream HTTP ({CamIP})")
+    print("5 - Especificar URL personalizada")
     
-    source_choice = input("Opción [1-4] (Enter = 1): ").strip()
+    source_choice = input("Opcion [1-5] (Enter = 1): ").strip()
     
     if source_choice == "2":
+        # Phone Stream MJPEG
+        print("\nDetecting phone hotspot IP...")
+        gw_ip = detect_phone_gateway()
+        if gw_ip:
+            port = SOURCE_CONFIGS["phone_stream"]["port"]
+            path = SOURCE_CONFIGS["phone_stream"]["path"]
+            stream_url = f"http://{gw_ip}:{port}{path}"
+            print(f"Phone IP: {gw_ip}")
+            print(f"Stream URL: {stream_url}")
+            src = stream_url
+            source_type = "phone_stream"
+        else:
+            print("Could not detect phone IP.")
+            manual_ip = input("Enter phone hotspot IP: ").strip()
+            port = SOURCE_CONFIGS["phone_stream"]["port"]
+            path = SOURCE_CONFIGS["phone_stream"]["path"]
+            src = f"http://{manual_ip}:{port}{path}"
+            source_type = "phone_stream"
+    elif source_choice == "3":
         src = "0"
         source_type = "default"
-    elif source_choice == "3":
+    elif source_choice == "4":
         src = "stream"
         source_type = "stream"
-    elif source_choice == "4":
+    elif source_choice == "5":
         src = input("Introduce la URL del stream: ").strip()
         source_type = "stream"
     else:
-        # Default: scrcpy (DJI drone setup)
+        # Default: Scrcpy
         src = "scrcpy"
         source_type = "scrcpy"
     
@@ -2958,8 +3716,8 @@ if __name__ == '__main__':
     
     proc.show_video_info = True  # Show detection info overlay
     
-    # Optimización: Si solo usa pose (no ArUco), detección más frecuente
-    if not getattr(getattr(Config, 'AI', None), 'USE_ARUCO_MARKERS', False):
+    # Optimización: Si solo usa pose (no ArUco), detección más frecuente (only in auto mode)
+    if framerate_mode == 'auto' and not getattr(getattr(Config, 'AI', None), 'USE_ARUCO_MARKERS', False):
         proc.detection_interval = 2  # Más frecuente para pose-only
     
     # Cargar calibración solo si se usa ArUco (optimización de inicio)
@@ -3005,18 +3763,22 @@ if __name__ == '__main__':
             data = np.load(cal_path)
             proc.frame_width = int(data.get('width', 640))
             proc.frame_height = int(data.get('height', 480))
-        except:
+            # Use calibration FOV if K matrix is available (even in pose-only mode)
+            if 'K' in data:
+                K = data['K']
+                fx, fy = K[0, 0], K[1, 1]
+                proc.fov_x, proc.fov_y = compute_fov(fx, fy, proc.frame_width, proc.frame_height)
+            else:
+                proc.fov_x = 60.0
+                proc.fov_y = 45.0
+        except Exception:
             # Valores por defecto si falla
             proc.frame_width = 640
             proc.frame_height = 480
-        
-        # FOV aproximado para pose
-        proc.fov_x = 60.0
-        proc.fov_y = 45.0
+            proc.fov_x = 60.0
+            proc.fov_y = 45.0
     
-    # Inicializar consola
-    proc.console = ConsoleBuffer()
-    proc.cmd_console = ConsoleBuffer()
+    # Add startup info to existing consoles (don't re-create — preserves init messages)
     if proc.use_aruco:
         proc.cmd_console.add_output(f"Usando calibración: {cal_file}")
     else:
@@ -3038,12 +3800,15 @@ if __name__ == '__main__':
         serial_baud=BAUD,
         serial_timeout=1,
         wifi_ip=CarIP,
-        wifi_port=ESP_PORT
+        wifi_port=ESP_PORT,
+        reconnect_grace=RECONNECT_GRACE
     )
     
-    proc.cmd_console.add_output(f"🔌 Control: {control_mode.upper()}")
+    proc.cmd_console.add_output(f"Control: {control_mode.upper()} (2-byte Arduino protocol)")
     if control_mode == "serial":
-        proc.cmd_console.add_output(f"   Puerto: {PUERTO} @ {BAUD} baud")
+        port_label = PUERTO if PUERTO.lower() != 'auto' else 'auto-detect'
+        proc.cmd_console.add_output(f"   Puerto: {port_label} @ {BAUD} baud")
+        proc.cmd_console.add_output(f"   Reconexion: {RECONNECT_GRACE}s grace")
     else:
         proc.cmd_console.add_output(f"   WiFi: {CarIP}:{ESP_PORT}")
     proc.cmd_console.add_output(f"📋 Cola de frames: {frame_queue_size}")
@@ -3053,17 +3818,19 @@ if __name__ == '__main__':
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_VOICE_RECORD} = Grabar comando de voz")
     proc.cmd_console.add_output(f"   {chr(Config.Keybinds.KEY_FACE_RECOGNITION)} = Reconocimiento facial")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = Cancelar navegación")
+    proc.cmd_console.add_output(f"   6 = Toggle Modo Seguro (velocidad mínima)")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
     proc.cmd_console.add_output("")
 
     # ─── Auto-load face recognition (ArcFace via ONNX) ────────────────
     if FACE_RECOGNITION_AVAILABLE:
         try:
-            db_dir = getattr(getattr(Config, 'AI', None), 'FACE_DATABASE_DIR', 'face_database')
+            db_dir = resolve_face_database_dir()
             proc.face_system = LiveFaceRecognition(database_dir=db_dir)
             proc.face_recognition_enabled = True
             people = proc.face_system.list_people()
             proc.cmd_console.add_output(f"👤 Face recognition ON — {len(people)} enrolled")
+            proc.cmd_console.add_output(f"   DB: {db_dir}")
             if people:
                 proc.cmd_console.add_output(f"   Known: {', '.join(people)}")
         except Exception as e:
@@ -3075,7 +3842,7 @@ if __name__ == '__main__':
 
     # Crear e iniciar hilos
     threads = [
-        threading.Thread(target=capture_thread, args=(src, frame_q, proc)),
+        threading.Thread(target=capture_thread, args=(src, frame_q, proc, source_type)),
         threading.Thread(target=processing_worker, args=(proc, frame_q)),
         threading.Thread(target=display_thread, args=(proc,)),
         threading.Thread(target=prompt_thread, args=(proc,)),

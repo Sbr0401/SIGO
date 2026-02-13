@@ -10,10 +10,11 @@ import numpy as np
 # ==========================
 class HardwareConfig:
     """Hardware connection settings"""
-    # Serial port settings
-    SERIAL_PORT = 'COM8'
+    # Serial port settings ('auto' = scan for Arduino automatically)
+    SERIAL_PORT = 'auto'
     SERIAL_BAUD = 9600
     SERIAL_TIMEOUT = 1
+    SERIAL_RECONNECT_GRACE = 15  # seconds to try reconnecting
     
     # WiFi settings
     CAMERA_IP = "192.168.165.106"
@@ -203,6 +204,7 @@ class KeybindConfig:
     
     # Navigation controls
     KEY_CANCEL_NAV = '5'  # Cancel active navigation
+    KEY_SAFE_MODE = ord('6')  # Toggle safe speed mode
     
     # Feature toggles
     KEY_FACE_RECOGNITION = ord('4')  # Toggle face recognition

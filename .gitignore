@@ -55,3 +55,4 @@ build/
 # Temp files
 *.tmp
 *.log
+.scrcpy_device

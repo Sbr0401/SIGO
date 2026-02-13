@@ -281,6 +281,7 @@ SMOOTH_WINDOW_SIZE = getattr(Config.Vision, 'SMOOTH_WINDOW_SIZE', 5)
 GAMMA_CORRECTION = getattr(Config.Vision, 'GAMMA_CORRECTION', 1.2)
 
 # Configuraciones por tipo de fuente (from Config)
+# Primary use case: DJI Spark via scrcpy (Android phone on DJI Controller)
 if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
     SOURCE_CONFIGS = Config.Source.SOURCES
 else:
@@ -2496,10 +2497,13 @@ def prompt_thread(proc):
 #  CAPTURAS
 # ==========================
 def capture_scrcpy_window():
+    """Capture the scrcpy window showing DJI GO 4 from the Android phone."""
     try:
         hwnd = win32gui.FindWindow(None, "scrcpy")
         if not hwnd:
-            raise Exception("scrcpy window not found")
+            raise Exception(
+                'scrcpy window not found — run launch_scrcpy_wireless.bat first'
+            )
 
         left_c, top_c, right_c, bottom_c = win32gui.GetClientRect(hwnd)
         width  = right_c  - left_c
@@ -2546,7 +2550,8 @@ def capture_thread(src, frame_q, proc):
             proc.stop_event.set()
             return
             
-        proc.cmd_console.add_output("Using scrcpy window capture mode")
+        proc.cmd_console.add_output("Using scrcpy window capture (DJI Spark via Android)")
+        proc.cmd_console.add_output("Make sure scrcpy is running (launch_scrcpy_wireless.bat)")
         config = SOURCE_CONFIGS[source_type]
         proc.frame_time = 1.0 / config["target_fps"]
         
@@ -2883,6 +2888,8 @@ def manual_control_loop(proc: VideoProcessor):
 # ==========================
 if __name__ == '__main__':
     # Configuraciones por tipo de fuente (incluye modo de control)
+    # Primary use: DJI Spark drone via Android phone running DJI GO 4,
+    # captured wirelessly through scrcpy (phone plugged into DJI Controller).
     SOURCE_CONFIGS = {
         "default": {
             "calibration": "calibration/calINSPIRO.npz",
@@ -2894,7 +2901,7 @@ if __name__ == '__main__':
             "calibration": "calibration/calINSPIRO.npz",
             "detection_interval": 5,
             "target_fps": 30,
-            "control": "serial"   # scrcpy → Serial
+            "control": "serial"   # DJI Controller → Serial
         },
         "stream": {
             "calibration": "calibration/calINSPIRO.npz",
@@ -2902,25 +2909,21 @@ if __name__ == '__main__':
             "target_fps": 15,
             "url": f"http://{CamIP}/stream",
             "control": "wifi",
-             # stream IP → WiFi
         }
     }
 
     # Solicitar tipo de fuente
     print("Selecciona la fuente de video:")
-    print("1 - Cámara local")
-    print("2 - Scrcpy (Android)")
+    print("1 - Scrcpy (DJI Spark via Android)  [default]")
+    print("2 - Cámara local (webcam)")
     print(f"3 - Stream HTTP ({CamIP})")
     print("4 - Especificar URL personalizada")
     
-    source_choice = input("Opción [1-4]: ").strip()
+    source_choice = input("Opción [1-4] (Enter = 1): ").strip()
     
-    if source_choice == "1":
+    if source_choice == "2":
         src = "0"
         source_type = "default"
-    elif source_choice == "2":
-        src = "scrcpy"
-        source_type = "scrcpy"
     elif source_choice == "3":
         src = "stream"
         source_type = "stream"
@@ -2928,8 +2931,9 @@ if __name__ == '__main__':
         src = input("Introduce la URL del stream: ").strip()
         source_type = "stream"
     else:
-        src = "0"
-        source_type = "default"
+        # Default: scrcpy (DJI drone setup)
+        src = "scrcpy"
+        source_type = "scrcpy"
     
     # Inicializar el procesador con el tipo de fuente
     proc = VideoProcessor(source_type=source_type)

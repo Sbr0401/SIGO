@@ -1272,6 +1272,18 @@ class VideoProcessor:
     def undistort(self, frame):
         return cv2.undistort(frame, self.K, self.D, None, self.K)
 
+    def _init_aruco_detector(self):
+        """Initialize ArUco detector (called lazily only when ArUco mode is enabled)."""
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        params = cv2.aruco.DetectorParameters()
+        params.minMarkerPerimeterRate = 0.02
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshConstant = 7
+        params.polygonalApproxAccuracyRate = 0.05
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
+
     def _prune_expired(self):
         """Remove expired markers and clean up resources"""
         now = time.time()

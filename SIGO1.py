@@ -784,12 +784,14 @@ GESTURE_MIN_FRAMES = 5
 # Cooldown (seconds) between the same gesture triggering a command
 GESTURE_COOLDOWN = 4.0
 
-def detect_gesture(kpts, gesture_history: deque) -> Optional[str]:
+def detect_gesture(kpts, gesture_history: deque, bbox=None) -> Optional[str]:
     """Detect a gesture from pose keypoints.
 
     Args:
         kpts: (17, 3) keypoints  (x, y, confidence)
         gesture_history: deque(maxlen=10) of recent gesture strings (caller managed)
+        bbox: (x1, y1, x2, y2) bounding box — used to reject stray keypoints
+              from overlapping persons
 
     Returns:
         Gesture string if a stable gesture is detected, else None.
@@ -808,9 +810,51 @@ def detect_gesture(kpts, gesture_history: deque) -> Optional[str]:
 
     nose_y = kpts[KPT_NOSE][1]
 
-    # Check wrists above nose (raised hand / both hands up)
-    l_above = has_l_wri and kpts[KPT_L_WRI][1] < nose_y
-    r_above = has_r_wri and kpts[KPT_R_WRI][1] < nose_y
+    # --- Bbox-based containment margin ---
+    # Allow wrist to extend above the bbox (raised hand) but reject wrists
+    # that are horizontally far outside the person's box (likely another person).
+    if bbox is not None:
+        bx1, by1, bx2, by2 = bbox
+        bw = bx2 - bx1
+        # Horizontal margin: 50% of bbox width on each side
+        x_lo = bx1 - bw * 0.5
+        x_hi = bx2 + bw * 0.5
+    else:
+        x_lo, x_hi = -1e9, 1e9
+
+    def _wrist_valid(wrist_idx, shoulder_idx, elbow_idx):
+        """Check that a wrist is above the nose AND plausibly belongs to
+        this person: it must be horizontally within the expanded bbox
+        and connected through a visible arm chain (shoulder→elbow→wrist)."""
+        if not _kpt_visible(kpts, wrist_idx):
+            return False
+        wx, wy = kpts[wrist_idx][0], kpts[wrist_idx][1]
+        # Must be above nose
+        if wy >= nose_y:
+            return False
+        # Horizontal containment: reject wrists far outside this person's box
+        if wx < x_lo or wx > x_hi:
+            return False
+        # Arm chain: require at least the shoulder to be visible and on
+        # the same side as the wrist (elbow is nice-to-have but optional)
+        if not _kpt_visible(kpts, shoulder_idx):
+            return False
+        sx = kpts[shoulder_idx][0]
+        # Shoulder must also be within the expanded bbox
+        if sx < x_lo or sx > x_hi:
+            return False
+        # If elbow is visible, verify it's between shoulder and wrist vertically
+        # (sanity: elbow shouldn't be below the shoulder when hand is raised)
+        if _kpt_visible(kpts, elbow_idx):
+            ey = kpts[elbow_idx][1]
+            sy = kpts[shoulder_idx][1]
+            # Elbow should be above or near shoulder level when hand is up
+            if ey > sy + abs(sy - wy) * 0.5:
+                return False
+        return True
+
+    l_above = _wrist_valid(KPT_L_WRI, KPT_L_SH, KPT_L_ELB)
+    r_above = _wrist_valid(KPT_R_WRI, KPT_R_SH, KPT_R_ELB)
 
     if l_above and r_above:
         gesture = GESTURE_BOTH_HANDS_UP
@@ -2053,7 +2097,8 @@ class VideoProcessor:
             if pid not in self.gesture_histories:
                 self.gesture_histories[pid] = deque(maxlen=10)
 
-            gesture = detect_gesture(kpts, self.gesture_histories[pid])
+            gesture = detect_gesture(kpts, self.gesture_histories[pid],
+                                     bbox=data.get('bbox'))
             self.gesture_active[pid] = gesture
 
             # --- BOTH_HANDS_UP: always processed (cancels gesture nav) ---

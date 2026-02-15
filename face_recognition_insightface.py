@@ -240,6 +240,35 @@ class FaceDatabase:
                 return True
         return False
 
+    def rename_person(self, old_name: str, new_name: str) -> bool:
+        """Rename a person in the database (embeddings + image folder)."""
+        with self.lock:
+            if old_name not in self.people:
+                return False
+            if new_name in self.people:
+                # Merge into existing entry
+                self.people[new_name]['embeddings'].extend(
+                    self.people[old_name]['embeddings']
+                )
+            else:
+                self.people[new_name] = self.people[old_name]
+            del self.people[old_name]
+            self._save()
+
+        # Rename image folder if it exists
+        old_dir = self.database_dir / old_name
+        new_dir = self.database_dir / new_name
+        if old_dir.exists():
+            import shutil
+            if new_dir.exists():
+                # Move files into existing folder
+                for f in old_dir.iterdir():
+                    shutil.move(str(f), str(new_dir / f.name))
+                shutil.rmtree(old_dir, ignore_errors=True)
+            else:
+                old_dir.rename(new_dir)
+        return True
+
     def list_people(self) -> List[str]:
         with self.lock:
             return list(self.people.keys())

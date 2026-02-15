@@ -3143,6 +3143,12 @@ REMOVE_FACE_RE = re.compile(
     re.IGNORECASE
 )
 
+# Matches: "rename Yoyo to Yosef", "renombrar Maria a MariaG"
+RENAME_FACE_RE = re.compile(
+    r'(?:rename|renombrar|cambiar\s+nombre)\s+(.+?)\s+(?:to|a|->|→)\s+(.+)',
+    re.IGNORECASE
+)
+
 def _resolve_name_to_person(proc, name: str):
     """Find a tracked person_id by their recognised face name.
     Returns person_id string or None."""
@@ -3383,6 +3389,31 @@ def prompt_thread(proc):
                 f"📸 Save {person_id} as '{target_name}'?\n"
                 f"   Type 'y' to confirm or 'n' to cancel"
             )
+            continue
+
+        # ─── Check for face rename command ──────────────────────────
+        rename_match = RENAME_FACE_RE.match(last_command)
+        if rename_match and proc.face_system:
+            old_name = rename_match.group(1).strip()
+            new_name = rename_match.group(2).strip()
+            known = proc.face_system.list_people()
+            # Find case-insensitive match for old name
+            actual_old = None
+            for kn in known:
+                if kn.lower() == old_name.lower():
+                    actual_old = kn
+                    break
+            if actual_old:
+                proc.face_system.database.rename_person(actual_old, new_name)
+                # Update live identity references
+                proc.face_system.clear_cache()
+                with proc.lock:
+                    for pid in list(proc.face_identities.keys()):
+                        if proc.face_identities[pid][0] == actual_old:
+                            proc.face_identities[pid] = (new_name, proc.face_identities[pid][1])
+                proc.cmd_console.add_output(f"✅ Renamed '{actual_old}' → '{new_name}'")
+            else:
+                proc.cmd_console.add_output(f"❌ '{old_name}' not found. Known: {', '.join(known) if known else '(empty)'}")
             continue
 
         # ─── Check for face removal command ─────────────────────────

@@ -1434,10 +1434,6 @@ class VideoProcessor:
         self.gesture_active = {}          # person_id -> current gesture string or None
         self.gesture_nav_target = None    # person_id currently being navigated to via gesture
         
-        # F2: Person re-identification across tracking loss
-        self.lost_persons = {}            # person_id -> {face_emb, upper_color, lower_color, last_seen, identity}
-        self._reid_max_age = 30.0         # Max seconds to keep a lost person for matching
-        
         # F4: TTS enabled flag (speaks navigation events)
         self.tts_enabled = TTS_AVAILABLE
         
@@ -1965,38 +1961,17 @@ class VideoProcessor:
                         'position_label': _position_label(ax_smooth),
                     }
         
-        # --- F2: Save lost persons for re-ID before removing ---
+        # --- Clean up expired persons ---
         with self.lock:
             for pid in list(self.history.keys()):
                 if pid.startswith('person_') and pid not in seen_persons:
                     if time.time() - self.history[pid].get('last_seen', 0) > self.expire_time:
-                        # Save face embedding + appearance for re-identification
-                        lost_data = self.history[pid]
-                        face_emb = None
-                        if self.face_system and pid in getattr(self.face_system, '_last_embeddings', {}):
-                            face_emb = self.face_system._last_embeddings[pid]
-                        self.lost_persons[pid] = {
-                            'face_emb': face_emb,
-                            'upper_color': lost_data.get('upper_color', 'unknown'),
-                            'lower_color': lost_data.get('lower_color', 'unknown'),
-                            'last_seen': lost_data.get('last_seen', time.time()),
-                            'identity': self.face_identities.get(pid),
-                        }
                         del self.history[pid]
                         self.face_identities.pop(pid, None)
                         self.smooth.pop(pid, None)
                         self.gesture_histories.pop(pid, None)
                         self.gesture_cooldowns.pop(pid, None)
                         self.gesture_active.pop(pid, None)
-        
-        # --- F2: Purge very old lost persons ---
-        now = time.time()
-        for pid in list(self.lost_persons.keys()):
-            if now - self.lost_persons[pid]['last_seen'] > self._reid_max_age:
-                del self.lost_persons[pid]
-
-        # --- F2: Attempt re-ID for newly appeared persons ---
-        self._attempt_reid(seen_persons)
         
         # --- F1: Gesture recognition (when enabled) ---
         if self.gesture_mode:
@@ -2011,66 +1986,6 @@ class VideoProcessor:
         if self._obstacle_frame_counter >= OBSTACLE_DETECT_INTERVAL:
             self._obstacle_frame_counter = 0
             self._detect_obstacles(frame)
-    
-    def _attempt_reid(self, seen_persons):
-        """F2: Try to match newly appeared persons against recently lost ones."""
-        if not self.lost_persons:
-            return
-        for pid in seen_persons:
-            # Only check persons that don't already have an identity
-            if pid in self.face_identities:
-                continue
-            data = self.history.get(pid)
-            if not data:
-                continue
-            
-            best_match_pid = None
-            best_score = 0.0
-            
-            for lost_pid, lost_data in self.lost_persons.items():
-                score = 0.0
-                checks = 0
-                
-                # Color matching (cheap)
-                if data.get('upper_color') != 'unknown' and lost_data.get('upper_color') != 'unknown':
-                    checks += 1
-                    if data['upper_color'] == lost_data['upper_color']:
-                        score += 0.3
-                if data.get('lower_color') != 'unknown' and lost_data.get('lower_color') != 'unknown':
-                    checks += 1
-                    if data['lower_color'] == lost_data['lower_color']:
-                        score += 0.2
-                
-                # Face embedding matching (expensive but accurate)
-                if lost_data.get('face_emb') is not None and self.face_system:
-                    # Try to get current person's face embedding
-                    kpts = data.get('keypoints')
-                    if kpts is not None and hasattr(self, '_raw_frame') and self._raw_frame is not None:
-                        try:
-                            raw = self._raw_frame
-                            face_roi = self.face_system._extract_face_roi(raw, kpts)
-                            if face_roi is not None:
-                                emb = self.face_system._compute_embedding(face_roi)
-                                if emb is not None:
-                                    sim = float(np.dot(emb, lost_data['face_emb']))
-                                    if sim > 0.3:
-                                        score += sim * 0.5  # Weight face heavily
-                                        checks += 1
-                        except Exception:
-                            pass
-                
-                if checks > 0 and score > best_score:
-                    best_score = score
-                    best_match_pid = lost_pid
-            
-            # Require minimum confidence for re-ID
-            if best_match_pid and best_score >= 0.4:
-                lost_identity = self.lost_persons[best_match_pid].get('identity')
-                if lost_identity:
-                    with self.lock:
-                        self.face_identities[pid] = lost_identity
-                    self.cmd_console.add_output(f"🔄 Re-ID: {pid} ← {best_match_pid} ({lost_identity[0]})")
-                del self.lost_persons[best_match_pid]
     
     def _process_gestures(self, seen_persons):
         """F1: Detect gestures from keypoints and trigger actions.

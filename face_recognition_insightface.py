@@ -381,27 +381,10 @@ class LiveFaceRecognition:
         embedding = self.arcface.get_embedding(aligned)
         name, sim = self.database.recognize(embedding, self.threshold)
 
-        # F2: Store embedding for re-identification after tracking loss
-        if not hasattr(self, '_last_embeddings'):
-            self._last_embeddings = {}
-        self._last_embeddings[person_id] = embedding
-
         if name:
             with self._lock:
                 self._cache[person_id] = (name, sim, now)
         return name, sim
-
-    # ── F2 helpers for re-identification ───────────────────────────────
-    def _extract_face_roi(self, frame: np.ndarray, keypoints: np.ndarray) -> 'np.ndarray | None':
-        """Extract and align face ROI from keypoints (wrapper for re-ID)."""
-        return self.extract_face(frame, keypoints)
-
-    def _compute_embedding(self, aligned_face: np.ndarray) -> 'np.ndarray | None':
-        """Compute ArcFace embedding from an already aligned face."""
-        try:
-            return self.arcface.get_embedding(aligned_face)
-        except Exception:
-            return None
 
     # ── live enrollment ────────────────────────────────────────────────
     def enroll_person(self, frame: np.ndarray, keypoints: np.ndarray,

@@ -4131,8 +4131,13 @@ def display_thread(proc):
                             proc.cmd_console.add_output(f"❌ Face recognition error: {e}")
                             proc.face_recognition_enabled = False
                     else:
+                        # Re-scan for new photos added while running
+                        auto_count = proc.face_system.auto_enroll_from_photos()
                         people = proc.face_system.list_people()
-                        proc.cmd_console.add_output(f"✅ Face recognition ON ({len(people)} enrolled)")
+                        msg = f"✅ Face recognition ON ({len(people)} enrolled)"
+                        if auto_count > 0:
+                            msg += f" (+{auto_count} new from photos)"
+                        proc.cmd_console.add_output(msg)
                 else:
                     proc.cmd_console.add_output("⏸️ Face recognition OFF")
             else:
@@ -4478,9 +4483,13 @@ if __name__ == '__main__':
         try:
             db_dir = resolve_face_database_dir()
             proc.face_system = LiveFaceRecognition(database_dir=db_dir)
+            auto_count = proc.face_system.auto_enroll_from_photos()
             proc.face_recognition_enabled = True
             people = proc.face_system.list_people()
-            proc.cmd_console.add_output(f"👤 Face recognition ON — {len(people)} enrolled")
+            msg = f"👤 Face recognition ON — {len(people)} enrolled"
+            if auto_count > 0:
+                msg += f" (+{auto_count} from photos)"
+            proc.cmd_console.add_output(msg)
             proc.cmd_console.add_output(f"   DB: {db_dir}")
             if people:
                 proc.cmd_console.add_output(f"   Known: {', '.join(people)}")

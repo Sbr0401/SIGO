@@ -206,7 +206,11 @@ class FaceDatabase:
                 img_dir = self.database_dir / name
                 img_dir.mkdir(exist_ok=True)
                 ts = int(time.time() * 1000)
-                cv2.imwrite(str(img_dir / f"enrolled_{ts}.jpg"), face_image)
+                fname = f"enrolled_{ts}.jpg"
+                cv2.imwrite(str(img_dir / fname), face_image)
+                # Track filename so auto_enroll_from_photos() won't re-enroll it
+                files_list = self.people[name].setdefault('_enrolled_files', [])
+                files_list.append(fname)
 
             self._save()
             return True

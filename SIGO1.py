@@ -26,7 +26,6 @@ import ctypes
 import math
 import subprocess
 import shutil
-from dataclasses import dataclass
 from typing import Optional, List
 import numpy.typing as npt
 try:
@@ -515,8 +514,19 @@ DISTANCE_TARGET = getattr(Config.Navigation, 'DISTANCE_TARGET', 0.3)
 DIST_CORRECTION = getattr(Config.Navigation, 'DISTANCE_CORRECTION', 1.0)
 YOLO_CONF = getattr(Config.AI, 'YOLO_CONFIDENCE', 0.5)
 
-# Navigation speed safety mode (toggle with keybind)
-NAV_SAFE_MODE = False
+# Navigation speed safety mode (toggle with keybind) — thread-safe Event
+_NAV_SAFE_MODE_EVT = threading.Event()   # .is_set() == safe mode ON
+
+def get_nav_safe_mode() -> bool:
+    return _NAV_SAFE_MODE_EVT.is_set()
+
+def toggle_nav_safe_mode() -> bool:
+    """Toggle safe mode and return the new state."""
+    if _NAV_SAFE_MODE_EVT.is_set():
+        _NAV_SAFE_MODE_EVT.clear()
+    else:
+        _NAV_SAFE_MODE_EVT.set()
+    return _NAV_SAFE_MODE_EVT.is_set()
 
 # ArUco marker constants
 ARUCO_MARKER_SIZE = getattr(Config.Vision, 'ARUCO_MARKER_SIZE', 0.20)
@@ -530,46 +540,17 @@ SMOOTH_WINDOW_SIZE = getattr(Config.Vision, 'SMOOTH_WINDOW_SIZE', 5)
 # Camera correction
 GAMMA_CORRECTION = getattr(Config.Vision, 'GAMMA_CORRECTION', 1.2)
 
-# Configuraciones por tipo de fuente — canonical definition in __main__,
-# this is a minimal fallback for when the module is imported by tests.
+# Configuraciones por tipo de fuente — single canonical definition.
 if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
     SOURCE_CONFIGS = Config.Source.SOURCES
 else:
     SOURCE_CONFIGS = {
         "default": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "wifi"},
-        "scrcpy": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "serial"},
+        "scrcpy":  {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "width": 2340, "height": 1080, "control": "serial"},
+        "smartview": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 3, "target_fps": 30, "control": "serial"},
+        "phone_stream": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 2, "target_fps": 20, "port": 8080, "path": "/stream.mjpeg", "control": "serial"},
+        "stream": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 1, "target_fps": 15, "url": f"http://{CamIP}/stream", "control": "wifi"},
     }
-
-# ==========================
-#  DATA STRUCTURES
-# ==========================
-@dataclass
-class MarkerState:
-    """Type-safe marker state data"""
-    id: int
-    corners: npt.NDArray[np.int32]
-    distance: float
-    angle_x: float
-    angle_y: float
-    prev_distance: Optional[float]
-    prev_angle_x: Optional[float]
-    prev_angle_y: Optional[float]
-    last_seen: float
-    draw_box: bool = True
-    last_detection_time: Optional[float] = None
-    
-    @property
-    def is_active(self) -> bool:
-        """Check if marker was seen recently"""
-        return time.time() - self.last_seen <= MARKER_EXPIRE_TIME
-
-@dataclass
-class DetectedObject:
-    """Type-safe detected object data"""
-    class_id: int
-    confidence: float
-    bbox: tuple[int, int, int, int]
-    track_id: Optional[int] = None
 
 # ==========================
 #  CONSOLA GUI
@@ -689,9 +670,18 @@ except ImportError:
 TORSO_AVG_WIDTH_M = 0.40   # Average shoulder width (40cm)
 TORSO_AVG_HEIGHT_M = 0.50  # Average torso height (shoulder to hip)
 HEAD_SHOULDER_M = 0.25     # Average nose-to-shoulder vertical distance (~25cm)
+SHIN_LENGTH_M = 0.45       # Average shin length (knee to ankle)
+INTER_EYE_M = 0.063        # Average inter-pupillary distance (~6.3cm)
 FULL_HEIGHT_M = 1.70       # Average full person height for bbox fallback
 FOCAL_PIX_DEFAULT = 640.0  # Default focal length in pixels (Lenovo LOQ 15 webcam @ 720p ~600-700px)
 CONF_MIN_KPT = 0.3         # Minimum keypoint confidence (lowered for webcam quality)
+
+# Distance smoothing
+DIST_EMA_ALPHA = 0.35      # EMA blending factor (0 = all history, 1 = all current)
+
+# Per-person adaptive calibration
+CALIB_HISTORY_MIN = 8           # Min fused samples before learning a correction
+CALIB_OUTLIER_THRESH = 0.50     # Max allowed deviation from median (50%) before rejecting an estimator
 
 # Orientation detection: when frontal, shoulder_width / torso_height ≈ 0.75-0.85
 # When sideways (90°), this ratio drops to ≈ 0.25-0.40
@@ -947,10 +937,10 @@ def estimate_distance_from_pose(kpts, bbox, focal_pix=FOCAL_PIX_DEFAULT):
     
     kpts: np.array shape (17, 3) -> (x, y, conf)
     bbox: (x1, y1, x2, y2)
-    Returns: (distance_meters, orientation_score, method_info) or (None, None, None)
+    Returns: (distance_meters, orientation_score, method_info, raw_estimates) or (None, None, None, [])
     """
     if focal_pix <= 0:
-        return None, None, None
+        return None, None, None, []
     
     # Step 1: Detect body orientation
     frontal_score, orient_method = estimate_body_orientation(kpts)
@@ -1021,11 +1011,49 @@ def estimate_distance_from_pose(kpts, bbox, focal_pix=FOCAL_PIX_DEFAULT):
             if weight > 0.3:
                 estimates.append((dist_hip, weight, 'hip_width'))
     
+    # --- Knee-to-ankle (shin) distance (VERTICAL - rotation-invariant) ---
+    l_kn_vis = _kpt_visible(kpts, KPT_L_KN)
+    r_kn_vis = _kpt_visible(kpts, KPT_R_KN)
+    l_an_vis = _kpt_visible(kpts, KPT_L_AN)
+    r_an_vis = _kpt_visible(kpts, KPT_R_AN)
+    shin_estimates = []
+    if l_kn_vis and l_an_vis:
+        shin_pix = abs(kpts[KPT_L_AN][1] - kpts[KPT_L_KN][1])
+        if shin_pix > 8:
+            shin_estimates.append(shin_pix)
+    if r_kn_vis and r_an_vis:
+        shin_pix = abs(kpts[KPT_R_AN][1] - kpts[KPT_R_KN][1])
+        if shin_pix > 8:
+            shin_estimates.append(shin_pix)
+    if shin_estimates:
+        avg_shin_pix = sum(shin_estimates) / len(shin_estimates)
+        dist_shin = (SHIN_LENGTH_M * focal_pix) / avg_shin_pix
+        weight = 2.0  # vertical, rotation-invariant, reliable when visible
+        estimates.append((dist_shin, weight, 'shin'))
+
+    # --- Inter-eye distance (close-range signal, < ~3 m) ---
+    if _kpt_visible(kpts, KPT_L_EYE) and _kpt_visible(kpts, KPT_R_EYE):
+        eye_dist_pix = distance_between_kpts(
+            (kpts[KPT_L_EYE][0], kpts[KPT_L_EYE][1]),
+            (kpts[KPT_R_EYE][0], kpts[KPT_R_EYE][1])
+        )
+        if eye_dist_pix > 5:
+            # Compensate for rotation (eyes compress horizontally like shoulders)
+            compensation = max(frontal_score, 0.40)
+            corrected_eye_pix = eye_dist_pix / compensation
+            dist_eye = (INTER_EYE_M * focal_pix) / corrected_eye_pix
+            # Only trust at close range (< ~3 m) — at far distances eye separation
+            # is just a few pixels and noise dominates
+            if dist_eye < 3.5:
+                weight = 2.5 * frontal_score  # very accurate when frontal + close
+                if weight > 0.3:
+                    estimates.append((dist_eye, weight, 'inter_eye'))
+
     # --- Bounding box height (always available, rotation-invariant but noisy) ---
     # Adapt reference height based on which body parts are actually visible
     x1, y1, x2, y2 = bbox
     bbox_height = y2 - y1
-    if bbox_height > 20:
+    if bbox_height > 10:
         # Determine what portion of the body the bbox covers
         has_ankles = _kpt_visible(kpts, KPT_L_AN) or _kpt_visible(kpts, KPT_R_AN)
         has_knees = _kpt_visible(kpts, KPT_L_KN) or _kpt_visible(kpts, KPT_R_KN)
@@ -1047,15 +1075,37 @@ def estimate_distance_from_pose(kpts, bbox, focal_pix=FOCAL_PIX_DEFAULT):
         weight = 1.0  # lowest priority, always available
         estimates.append((dist_bbox, weight, 'bbox_height'))
     
-    # Step 3: Weighted fusion
+    # Step 3: Outlier rejection + weighted fusion
     if not estimates:
-        return None, None, None
+        return None, None, None, []
+    
+    # If we have 3+ estimates, reject outliers before fusing.
+    # An estimate is an outlier if it deviates > CALIB_OUTLIER_THRESH from the
+    # weighted-median of all estimates.
+    if len(estimates) >= 3:
+        # Compute a rough weighted median (sort by distance, walk weights to 50%)
+        sorted_est = sorted(estimates, key=lambda e: e[0])
+        half_total = sum(w for _, w, _ in sorted_est) / 2
+        cum = 0.0
+        w_median = sorted_est[len(sorted_est) // 2][0]  # fallback
+        for d, w, _ in sorted_est:
+            cum += w
+            if cum >= half_total:
+                w_median = d
+                break
+        # Keep only estimates within CALIB_OUTLIER_THRESH of the weighted median
+        filtered = [
+            (d, w, m) for d, w, m in estimates
+            if abs(d - w_median) / max(w_median, 0.01) <= CALIB_OUTLIER_THRESH
+        ]
+        if len(filtered) >= 2:
+            estimates = filtered
     
     total_weight = sum(w for _, w, _ in estimates)
     fused_distance = sum(d * w for d, w, _ in estimates) / total_weight
     methods_used = '+'.join(f"{m}({w:.1f})" for _, w, m in estimates)
     
-    return fused_distance, frontal_score, methods_used
+    return fused_distance, frontal_score, methods_used, estimates
 
 def check_torso_visibility(kpts):
     """
@@ -1156,16 +1206,11 @@ class VideoProcessor:
             self.focal_length_pix = FOCAL_PIX_DEFAULT
             print(f"[WARNING] Using default focal length: {FOCAL_PIX_DEFAULT} pixels")
 
-        # ArUco detector
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        params = cv2.aruco.DetectorParameters()
-        params.minMarkerPerimeterRate = 0.02
-        params.adaptiveThreshWinSizeMin = 3
-        params.adaptiveThreshWinSizeMax = 23
-        params.adaptiveThreshConstant = 7
-        params.polygonalApproxAccuracyRate = 0.05
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
+        # ArUco detector (lazy — only init when ArUco mode is enabled)
+        self.aruco_dict = None
+        self.detector = None
+        if self.use_aruco:
+            self._init_aruco_detector()
 
         # Parameters
         self.roi_scale = roi_scale
@@ -1249,6 +1294,18 @@ class VideoProcessor:
         tol = 0.2 if area > 50000 else 0.4
         return (max(lengths)/min(lengths)) < (1 + tol)
 
+    def _init_aruco_detector(self):
+        """Initialise ArUco detector (called lazily only when ArUco mode is on)."""
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        params = cv2.aruco.DetectorParameters()
+        params.minMarkerPerimeterRate = 0.02
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshConstant = 7
+        params.polygonalApproxAccuracyRate = 0.05
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
+
     def _expand_roi(self, cx, cy, w, h, fh, fw):
         ew, eh = w*self.roi_scale, h*self.roi_scale
         x0 = max(0, int(cx - ew/2))
@@ -1272,8 +1329,10 @@ class VideoProcessor:
             if not self.history:
                 output_lines.append("No hay marcadores en el historial")
             else:
+                # Pre-compute active set once (avoids re-scanning history per marker)
+                active_set = set(self._get_active_markers())
                 for mid, d in self.history.items():
-                    status = "ACTIVO" if mid in self._get_active_markers() else "INACTIVO"
+                    status = "ACTIVO" if mid in active_set else "INACTIVO"
                     line = f"\nID {mid} [{status}] | Última distancia: {d['distance']:.2f}m \n Ángulo X: {d['angle_x']:+.1f}° | Ángulo Y: {d['angle_y']:+.1f}°"
                     objs = self.object_detections.get(mid, [])
                     if objs:
@@ -1442,8 +1501,10 @@ class VideoProcessor:
         
         DET_RAD = DETECTION_RADIUS_SCALE
         # Use YOLO tracking with ByteTrack (built-in, more reliable than MOSSE)
+        # Use same device as pose model (respects GPU/CPU config)
+        yolo_device = 0 if getattr(self, 'pose_device', None) == 'cuda' else 'cpu'
         try:
-            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=0, persist=True, classes=[0])
+            results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=yolo_device, persist=True, classes=[0])
         except Exception:
             results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device='cpu', persist=True, classes=[0])     
 
@@ -1557,9 +1618,11 @@ class VideoProcessor:
         all_kpts = np.concatenate([kpts_xy, kpts_conf.reshape(kpts_conf.shape[0], -1, 1)], axis=2)
         
         # Keep a raw (un-annotated) frame copy for face enrollment (thread-safe)
-        raw_copy = frame.copy()
-        with self.lock:
-            self._raw_frame = raw_copy
+        # Only copy when face recognition is enabled (saves ~3-5ms/frame otherwise)
+        if self.face_recognition_enabled:
+            raw_copy = frame.copy()
+            with self.lock:
+                self._raw_frame = raw_copy
         
         seen_persons = set()
         
@@ -1575,30 +1638,11 @@ class VideoProcessor:
             
             # Estimate distance with orientation-aware fusion
             result = estimate_distance_from_pose(kpts, box, self.focal_length_pix)
-            distance, frontal_score, method_info = result
+            distance, frontal_score, method_info, result_estimates = result
             
-            if distance is None:
-                # Final fallback: bbox height with visibility-aware reference
-                x1b, y1b, x2b, y2b = box
-                bbox_h = y2b - y1b
-                if bbox_h > 10:
-                    has_ankles = _kpt_visible(kpts, KPT_L_AN) or _kpt_visible(kpts, KPT_R_AN)
-                    has_knees = _kpt_visible(kpts, KPT_L_KN) or _kpt_visible(kpts, KPT_R_KN)
-                    has_hips = _kpt_visible(kpts, KPT_L_HP) or _kpt_visible(kpts, KPT_R_HP)
-                    has_head = _kpt_visible(kpts, KPT_NOSE)
-                    if has_ankles and has_head:
-                        ref = FULL_HEIGHT_M
-                    elif has_knees and has_head:
-                        ref = FULL_HEIGHT_M * 0.75
-                    elif has_hips and has_head:
-                        ref = FULL_HEIGHT_M * 0.55
-                    elif has_head:
-                        ref = FULL_HEIGHT_M * 0.35
-                    else:
-                        ref = FULL_HEIGHT_M
-                    distance = (ref * self.focal_length_pix) / bbox_h
-                    frontal_score = 0.5
-                    method_info = 'bbox_fallback'
+            # estimate_distance_from_pose already includes bbox_height internally;
+            # if it still returned None, all estimators failed (very small detections).
+            # Skip distance for this person rather than duplicating logic here.
 
             # Apply distance correction factor
             if distance is not None:
@@ -1617,19 +1661,58 @@ class VideoProcessor:
                 
                 seen_persons.add(person_id)
                 
-                # --- Temporal smoothing (same as ArUco markers) ---
+                # --- Temporal smoothing: EMA + median hybrid ---
+                # Median rejects spikes; EMA gives recency bias for moving targets.
                 buf = self.smooth.setdefault(person_id, {
                     'd': deque(maxlen=SMOOTH_WINDOW_SIZE),
                     'ax': deque(maxlen=SMOOTH_WINDOW_SIZE),
-                    'ay': deque(maxlen=SMOOTH_WINDOW_SIZE)
+                    'ay': deque(maxlen=SMOOTH_WINDOW_SIZE),
+                    'd_ema': None, 'ax_ema': None, 'ay_ema': None,
                 })
                 buf['d'].append(distance)
                 buf['ax'].append(angle_x)
                 buf['ay'].append(angle_y)
-                # Fast median for small deques (sorted middle — avoids np.median array overhead)
-                d_smooth = float(sorted(buf['d'])[len(buf['d']) // 2])
-                ax_smooth = float(sorted(buf['ax'])[len(buf['ax']) // 2])
-                ay_smooth = float(sorted(buf['ay'])[len(buf['ay']) // 2])
+                # Fast median for small deques
+                d_med = float(sorted(buf['d'])[len(buf['d']) // 2])
+                ax_med = float(sorted(buf['ax'])[len(buf['ax']) // 2])
+                ay_med = float(sorted(buf['ay'])[len(buf['ay']) // 2])
+                # Blend: EMA on the median (best of both worlds)
+                a = DIST_EMA_ALPHA
+                if buf['d_ema'] is None:
+                    buf['d_ema'], buf['ax_ema'], buf['ay_ema'] = d_med, ax_med, ay_med
+                else:
+                    buf['d_ema'] = a * d_med + (1 - a) * buf['d_ema']
+                    buf['ax_ema'] = a * ax_med + (1 - a) * buf['ax_ema']
+                    buf['ay_ema'] = a * ay_med + (1 - a) * buf['ay_ema']
+                d_smooth = buf['d_ema']
+                ax_smooth = buf['ax_ema']
+                ay_smooth = buf['ay_ema']
+
+                # --- Per-person adaptive calibration ---
+                # Track how vertical (reliable) estimators compare to the fused result.
+                # After enough samples, learn a per-person correction factor.
+                calib = self.smooth[person_id].setdefault('_calib', {
+                    'vert_dists': deque(maxlen=10),
+                    'fused_dists': deque(maxlen=10),
+                    'correction': 1.0,
+                })
+                # Collect vertical-only estimate for this frame (torso_height + shin)
+                vert_est = [d for d, _w, m in result_estimates
+                            if m in ('torso_height', 'shin', 'head_shoulder')]
+                if vert_est and distance is not None:
+                    avg_vert = sum(vert_est) / len(vert_est)
+                    calib['vert_dists'].append(avg_vert)
+                    calib['fused_dists'].append(distance)
+                    if len(calib['fused_dists']) >= CALIB_HISTORY_MIN:
+                        med_vert = float(sorted(calib['vert_dists'])[len(calib['vert_dists']) // 2])
+                        med_fused = float(sorted(calib['fused_dists'])[len(calib['fused_dists']) // 2])
+                        if med_fused > 0.05:
+                            # Blend toward vertical-estimator truth slowly
+                            raw_corr = med_vert / med_fused
+                            # Clamp correction to sensible range (0.7 .. 1.4)
+                            raw_corr = max(0.7, min(1.4, raw_corr))
+                            calib['correction'] = 0.9 * calib['correction'] + 0.1 * raw_corr
+                d_smooth *= calib['correction']
                 
                 # Store in history (navigation compatibility)
                 old = self.history.get(person_id, {})
@@ -1713,19 +1796,19 @@ class VideoProcessor:
         
         # --- Compact HUD overlay (no blending — opaque dark rect) ---
         if self.show_video_info and active:
-            ty = 22
-            cv2.rectangle(out, (4, 4), (280, 8 + len(active) * 18 + 14), (15, 15, 15), -1)
-            cv2.putText(out, "TRACKING", (10, ty), font, 0.45, (0, 200, 255), 1, LT)
-            ty += 18
+            ty = 24
+            cv2.rectangle(out, (4, 4), (340, 10 + len(active) * 22 + 16), (15, 15, 15), -1)
+            cv2.putText(out, "TRACKING", (10, ty), font, 0.55, (0, 200, 255), 1, LT)
+            ty += 22
             for mid in active:
                 d = self.history[mid]
                 is_person = isinstance(mid, str) and mid.startswith('person_')
                 if is_person:
                     pnum = mid.split('_')[1]
-                    cv2.putText(out, f"P{pnum} {d['distance']:.1f}m X:{d['angle_x']:+.0f} Y:{d['angle_y']:+.0f}", (10, ty), font, 0.40, (200, 200, 200), 1, LT)
+                    cv2.putText(out, f"P{pnum} {d['distance']:.1f}m X:{d['angle_x']:+.0f} Y:{d['angle_y']:+.0f}", (10, ty), font, 0.50, (220, 220, 220), 1, LT)
                 else:
-                    cv2.putText(out, f"ID{mid} {d['distance']:.1f}m", (10, ty), font, 0.40, (200, 200, 200), 1, LT)
-                ty += 18
+                    cv2.putText(out, f"ID{mid} {d['distance']:.1f}m", (10, ty), font, 0.50, (220, 220, 220), 1, LT)
+                ty += 22
 
         # --- Skeleton connections (cached once) ---
         if not hasattr(self, '_skeleton_connections'):
@@ -1763,7 +1846,7 @@ class VideoProcessor:
                 # Simple rectangle (1 call vs 8 corner lines)
                 cv2.rectangle(out, (x1, y1), (x2, y2), accent, 2, LT)
                 
-                # Label above bbox (opaque background, no blending)
+                # Label above bbox — large, high-contrast, easy to read
                 person_num = mid.split('_')[1]
                 label = f"P{person_num}"
                 if mid in self.face_identities:
@@ -1771,18 +1854,30 @@ class VideoProcessor:
                     label = f"{name} {confidence:.0%}"
                     accent = (255, 0, 220)
                 
-                full_label = f"{label} {distance:.1f}m"
-                ly = max(12, y1 - 6)
-                cv2.rectangle(out, (x1, ly - 14), (x1 + len(full_label) * 9 + 8, ly + 2), accent, -1)
-                cv2.putText(out, full_label, (x1 + 4, ly), font, 0.45, (255, 255, 255), 1, LT)
+                full_label = f"{label}  {distance:.1f}m"
+                # Use getTextSize for pixel-perfect background sizing
+                (tw, th), baseline = cv2.getTextSize(full_label, font, 0.65, 2)
+                ly = max(th + 10, y1 - 8)
+                pad = 6
+                cv2.rectangle(out, (x1 - 1, ly - th - pad), (x1 + tw + pad * 2, ly + pad), accent, -1)
+                cv2.putText(out, full_label, (x1 + pad, ly), font, 0.65, (255, 255, 255), 2, LT)
                 
                 # Skeleton — single thin line per connection, no glow
                 if 'keypoints' in d:
                     kpts = d['keypoints']
                     pts_cache = {}
+                    # Expand bbox by 30% to allow slight overshoot but
+                    # reject garbage coords (e.g. 0,0) that cause lines
+                    # flying off to corners
+                    bw, bh = x2 - x1, y2 - y1
+                    margin_x, margin_y = int(bw * 0.3), int(bh * 0.3)
+                    kx_lo, kx_hi = x1 - margin_x, x2 + margin_x
+                    ky_lo, ky_hi = y1 - margin_y, y2 + margin_y
                     for idx in range(min(17, len(kpts))):
                         if kpts[idx][2] > CONF_MIN_KPT:
-                            pts_cache[idx] = (int(kpts[idx][0]), int(kpts[idx][1]))
+                            kx, ky = int(kpts[idx][0]), int(kpts[idx][1])
+                            if kx_lo <= kx <= kx_hi and ky_lo <= ky <= ky_hi:
+                                pts_cache[idx] = (kx, ky)
                     
                     for a, b in self._skeleton_connections:
                         if a in pts_cache and b in pts_cache:
@@ -1922,8 +2017,7 @@ class VideoProcessor:
         active = self._get_active_markers()
         n_persons = sum(1 for m in active if isinstance(m, str) and m.startswith('person_'))
         device_str = 'GPU' if getattr(self, 'pose_device', '') == 'cuda' else 'CPU'
-        global NAV_SAFE_MODE
-        safe_txt = "SAFE" if NAV_SAFE_MODE else "NORMAL"
+        safe_txt = "SAFE" if get_nav_safe_mode() else "NORMAL"
         right_text = f"{n_persons}T | {device_str} | {safe_txt}"
         cv2.putText(area, right_text, (w - len(right_text) * 8 - 8, h - 7), font, 0.40, (180, 180, 190), 1, LT)
 
@@ -2176,16 +2270,13 @@ Return JSON:"""
                 if person_search:
                     chosen_id = f"person_{person_search.group(1)}"
                 else:
-                    # Single number fallback
+                    # Single number fallback — always produce string person_N
                     all_nums = re.findall(r'\d+', answer)
                     if len(all_nums) == 1:
                         chosen_id = f"person_{all_nums[0]}"
                     elif len(all_nums) > 1:
-                        # Try integer marker
-                        try:
-                            chosen_id = int(answer_lower.strip())
-                        except ValueError:
-                            pass
+                        # Multiple numbers — pick the first as person ID
+                        chosen_id = f"person_{all_nums[0]}"
         
         if chosen_id is None:
             print(f"[LLM DEBUG] FAILED to parse any ID from: '{raw_answer}'")
@@ -2361,8 +2452,7 @@ def _compute_nav_magnitudes(d: dict, target: float, safe_mode: bool = False):
 
 def send_commands_byte(d: dict, target: float):
     """Compute navigation magnitudes and send 2-byte Arduino command."""
-    global NAV_SAFE_MODE
-    mags = _compute_nav_magnitudes(d, target, safe_mode=NAV_SAFE_MODE)
+    mags = _compute_nav_magnitudes(d, target, safe_mode=get_nav_safe_mode())
     b1, b2 = encode_arduino_pair(
         ccw=mags['ccw'], cw=mags['cw'], up=mags['up'],
         down=mags['down'], fwd=mags['fwd'], bwd=mags['bwd']
@@ -2378,8 +2468,7 @@ def print_navigation_commands(d: dict, target: float, follow: bool = False):
     dist = d['distance']
     header = "SEGUIMIENTO" if follow else "OBJETIVO FIJO"
 
-    global NAV_SAFE_MODE
-    mags = _compute_nav_magnitudes(d, target, safe_mode=NAV_SAFE_MODE)
+    mags = _compute_nav_magnitudes(d, target, safe_mode=get_nav_safe_mode())
     ccw = mags['ccw']
     cw = mags['cw']
     up_m = mags['up']
@@ -2387,7 +2476,7 @@ def print_navigation_commands(d: dict, target: float, follow: bool = False):
     fwd = mags['fwd']
 
     gap_str = f"{dist - target:.2f}m restantes" if fwd > 0 else "EN POSICION"
-    mode_str = "MODO SEGURO: ON" if NAV_SAFE_MODE else "MODO SEGURO: OFF"
+    mode_str = "MODO SEGURO: ON" if get_nav_safe_mode() else "MODO SEGURO: OFF"
 
     return "\n".join([
         "",
@@ -2413,6 +2502,17 @@ def print_navigation_commands(d: dict, target: float, follow: bool = False):
 def whisper_record_and_transcribe():
     duration = getattr(getattr(Config, 'AI', None), 'WHISPER_DURATION', 4)
     language = getattr(getattr(Config, 'AI', None), 'WHISPER_LANGUAGE', 'es')
+    
+    # Check for available input device before attempting to record
+    try:
+        device_info = sd.query_devices(kind='input')
+        if device_info is None:
+            raise RuntimeError("No input audio device found")
+    except Exception as e:
+        raise RuntimeError(
+            f"No microphone available: {e}\n"
+            "  Check that a microphone is connected and enabled in system settings."
+        )
     
     print("🎤 Grabando audio (mantén presionada la tecla)...")
     
@@ -2554,6 +2654,92 @@ def detect_enrollment_intent(command: str):
         'reason': 'enroll_intent_detected'
     }
 
+# ==========================
+#  ENHANCE / ADD ANGLE COMMAND PARSING
+# ==========================
+# Verbs that signal the user wants to add a NEW perspective of an EXISTING person
+ENHANCE_VERB_RE = re.compile(
+    r'\b(?:enhance|update|improve|retrain|upgrade|refine|'
+    r'mejorar|actualizar|reentrenar|refinar)\b',
+    re.IGNORECASE
+)
+
+# Explicit "add angle / add perspective / add view" patterns
+ENHANCE_ANGLE_RE = re.compile(
+    r'\b(?:add|agregar|añadir|anadir)\s+'
+    r'(?:(?:a|an|una?|new|nuevo|nueva|more|otra?)\s+)*'
+    r'(?:angle|perspective|view|face|photo|foto|vista|ángulo|angulo|perspectiva|cara)\b',
+    re.IGNORECASE
+)
+
+# Extract the target name from enhance commands
+# "enhance Yoyo", "add angle for Yoyo", "improve Yoyo's face", "mejorar a Yoyo"
+ENHANCE_NAME_PATTERNS = [
+    # "for/of/de/a/para NAME"
+    r'(?:for|of|de|a|para)\s+["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40}?)(?:["\']?\s*(?:\'s)?\s*(?:face|cara|rostro|recognition|reconocimiento)?)\s*$',
+    # "enhance NAME", "update NAME", "mejorar NAME" (verb then name directly)
+    r'(?:enhance|update|improve|retrain|upgrade|refine|mejorar|actualizar|reentrenar|refinar)\s+'
+    r'(?:a\s+|el\s+|la\s+|al\s+)?["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40}?)["\']?\s*'
+    r'(?:\'s\s+)?(?:face|cara|rostro|recognition|reconocimiento)?\s*$',
+    # "add angle person_N NAME" or just "add angle NAME"
+    r'(?:angle|perspective|view|face|photo|foto|vista|ángulo|angulo|perspectiva|cara)\s+'
+    r'(?:(?:for|of|de|a|para)\s+)?'
+    r'(?:person[a]?[_\s]?\d+\s+)?'
+    r'["\']?([A-Za-zÀ-ÿ0-9 _\-]{2,40})["\']?\s*$',
+]
+
+def _extract_enhance_name(command: str) -> str:
+    """Extract the target name from an enhance/add-angle command."""
+    cmd = command.strip()
+    bad_tokens = {
+        'person', 'persona', 'face', 'cara', 'rostro', 'id',
+        'enhance', 'update', 'improve', 'retrain', 'upgrade', 'refine',
+        'mejorar', 'actualizar', 'reentrenar', 'refinar',
+        'add', 'agregar', 'añadir', 'anadir', 'angle', 'perspective',
+        'view', 'photo', 'foto', 'vista', 'ángulo', 'angulo', 'perspectiva',
+        'new', 'nuevo', 'nueva', 'more', 'otra', 'otro', 'a', 'an',
+        'for', 'of', 'de', 'para', 'the', 'el', 'la', 'al', 'recognition',
+        'reconocimiento', 'it', 'lo', 's',
+    }
+    for pat in ENHANCE_NAME_PATTERNS:
+        m = re.search(pat, cmd, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().rstrip("'")
+            if candidate.lower() not in bad_tokens and len(candidate) >= 2:
+                return candidate
+    return ''
+
+
+def detect_enhance_intent(command: str):
+    """Detect if user wants to add a new perspective/angle of an EXISTING person.
+
+    Returns:
+      None if not enhance intent
+      dict with keys: {'target_name': str|None, 'person_num': str|None, 'reason': str}
+    """
+    cmd = command.strip()
+    if not cmd:
+        return None
+
+    has_enhance_verb = bool(ENHANCE_VERB_RE.search(cmd))
+    has_angle_phrase = bool(ENHANCE_ANGLE_RE.search(cmd))
+
+    if not (has_enhance_verb or has_angle_phrase):
+        return None
+
+    person_num = None
+    pm = re.search(r'\b(?:person[a]?|id)[_\s\-]?(\d+)\b', cmd, re.IGNORECASE)
+    if pm:
+        person_num = pm.group(1)
+
+    target_name = _extract_enhance_name(cmd)
+    return {
+        'target_name': target_name if target_name else None,
+        'person_num': person_num,
+        'reason': 'enhance_intent_detected',
+    }
+
+
 # Matches: "remove Yoyo", "delete Maria", "borrar Juan", "eliminar persona Maria"
 REMOVE_FACE_RE = re.compile(
     r'(?:remove|delete|borrar|eliminar)\s+(?:face|persona|person)?\s*(.+)',
@@ -2605,10 +2791,12 @@ def prompt_thread(proc):
                 continue
             
             if cmd_low in ('y', 'yes', 'si', 'sí'):
-                # Execute enrollment
+                # Execute enrollment (same path for new & enhance — add_face appends)
                 pid = pe['person_id']
                 name = pe['name']
-                proc.cmd_console.add_output(f"📸 Enrolling {pid} as '{name}'...")
+                is_enhance = pe.get('enhance', False)
+                action_label = "Enhancing" if is_enhance else "Enrolling"
+                proc.cmd_console.add_output(f"📸 {action_label} {pid} as '{name}'...")
                 
                 with proc.lock:
                     person_data = proc.history.get(pid)
@@ -2624,7 +2812,10 @@ def prompt_thread(proc):
                     kpts = person_data.get('keypoints')
                     ok, msg = proc.face_system.enroll_person(raw_frame, kpts, name)
                     if ok:
-                        proc.cmd_console.add_output(f"✅ {msg}")
+                        if is_enhance:
+                            proc.cmd_console.add_output(f"✅ New angle added — {msg}")
+                        else:
+                            proc.cmd_console.add_output(f"✅ {msg}")
                         # Immediately tag this person
                         with proc.lock:
                             proc.face_identities[pid] = (name, 1.0)
@@ -2643,6 +2834,95 @@ def prompt_thread(proc):
                 proc.pending_enrollment = None
                 proc.cmd_console.add_output("⚠️ Enrollment cancelled (new command).")
                 # Fall through to process the new command normally
+
+        # ─── Check for ENHANCE / ADD-ANGLE intent (before enrollment) ─
+        enhance_intent = detect_enhance_intent(last_command)
+        if enhance_intent:
+            if not proc.face_system:
+                proc.cmd_console.add_output("❌ Face recognition not loaded.")
+                continue
+
+            target_name = (enhance_intent.get('target_name') or '').strip()
+            person_num = enhance_intent.get('person_num')
+
+            # If no name was parsed, ask the user
+            if not target_name:
+                known = proc.face_system.list_people()
+                known_str = ', '.join(known) if known else '(empty)'
+                proc.cmd_console.add_output(
+                    "❌ ¿A quién quieres mejorar? Faltó el nombre.\n"
+                    f"   Personas conocidas: {known_str}\n"
+                    "   Ejemplo: 'add angle for Yoyo' o 'enhance Yoyo'"
+                )
+                continue
+
+            # Verify the person already exists in the face database
+            known = proc.face_system.list_people()
+            actual_name = None
+            for kn in known:
+                if kn.lower() == target_name.lower():
+                    actual_name = kn
+                    break
+
+            if actual_name is None:
+                known_str = ', '.join(known) if known else '(empty)'
+                proc.cmd_console.add_output(
+                    f"❌ '{target_name}' no está en la base de datos.\n"
+                    f"   Personas conocidas: {known_str}\n"
+                    f"   Para registrar a alguien nuevo usa: 'save person N as {target_name}'"
+                )
+                continue
+
+            # Resolve which tracked person to capture from
+            person_id = None
+            if person_num:
+                person_id = f"person_{person_num}"
+            else:
+                # Try to find the person by their already-recognised identity
+                person_id = _resolve_name_to_person(proc, actual_name)
+                if person_id is None:
+                    # Fall back: if exactly one active person, use them
+                    with proc.lock:
+                        active_people = [
+                            pid for pid in proc.history.keys()
+                            if isinstance(pid, str) and pid.startswith('person_')
+                            and (time.time() - proc.history[pid].get('last_seen', 0) <= proc.expire_time)
+                        ]
+                    if len(active_people) == 1:
+                        person_id = active_people[0]
+                        proc.cmd_console.add_output(f"ℹ️ Using {person_id} (only active person)")
+                    elif len(active_people) == 0:
+                        proc.cmd_console.add_output("❌ No hay personas activas visibles.")
+                        continue
+                    else:
+                        options = ', '.join(active_people)
+                        proc.cmd_console.add_output(
+                            f"⚠️ Hay múltiples personas activas ({options}).\n"
+                            f"   Usa: 'add angle person N for {actual_name}'"
+                        )
+                        continue
+
+            with proc.lock:
+                person_exists = person_id in proc.history
+
+            if not person_exists:
+                proc.cmd_console.add_output(f"❌ {person_id} not found. Make sure they're visible.")
+                continue
+
+            # Count existing embeddings for context
+            n_existing = len(proc.face_system.database.people.get(actual_name, {}).get('embeddings', []))
+            proc.pending_enrollment = {
+                'person_id': person_id,
+                'name': actual_name,
+                'ts': time.time(),
+                'enhance': True,
+            }
+            proc.cmd_console.add_output(
+                f"📸 Add new angle of '{actual_name}' from {person_id}?\n"
+                f"   (currently {n_existing} embedding{'s' if n_existing != 1 else ''})\n"
+                f"   Type 'y' to confirm or 'n' to cancel"
+            )
+            continue
 
         # ─── Check for enrollment command/intention (robust parser) ─
         enroll_match = ENROLL_RE.match(last_command)
@@ -2816,7 +3096,13 @@ def prompt_thread(proc):
                 # Multiple persons or markers — use LLM
                 print(f"[NAV DEBUG] {len(person_ids)} persons detected: {person_ids}")
                 proc.console.add_output(f"[DEBUG] {len(person_ids)} personas activas: {person_ids}")
-                chosen_id = asyncio.run(choose_id_with_openai_async(last_command, info, proc))
+                _loop = asyncio.new_event_loop()
+                try:
+                    chosen_id = _loop.run_until_complete(
+                        choose_id_with_openai_async(last_command, info, proc)
+                    )
+                finally:
+                    _loop.close()
         print(f"ID elegido: {chosen_id}")
         proc.cmd_console.add_output(F"🔍 Seleccionado ID: {chosen_id if chosen_id is not None else 'Ninguno'}")
         
@@ -2991,50 +3277,14 @@ def capture_window_by_title(title_hint):
         return None
 
 def capture_scrcpy_window():
-    """Capture the scrcpy window client area using PrintWindow.
-    Works even when scrcpy is behind other windows (no lag when occluded)."""
-    try:
-        hwnd = win32gui.FindWindow(None, "scrcpy")
-        if not hwnd:
-            return None
-
-        # Get client area dimensions (DPI-aware thanks to SetProcessDpiAwareness)
-        left_c, top_c, right_c, bottom_c = win32gui.GetClientRect(hwnd)
-        width  = right_c  - left_c
-        height = bottom_c - top_c
-        if width <= 0 or height <= 0:
-            return None
-
-        # Use GetDC (client-area DC) — NOT GetWindowDC which includes title bar/borders
-        hwnd_dc = win32gui.GetDC(hwnd)
-        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
-        save_dc = mfc_dc.CreateCompatibleDC()
-
-        save_bitmap = win32ui.CreateBitmap()
-        save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
-        save_dc.SelectObject(save_bitmap)
-
-        # PrintWindow captures the actual window content regardless of Z-order
-        # PW_CLIENTONLY | PW_RENDERFULLCONTENT = capture client area with DWM compositing
-        ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_CLIENTONLY | PW_RENDERFULLCONTENT)
-
-        bmpstr  = save_bitmap.GetBitmapBits(True)
-        img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4)
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-        win32gui.DeleteObject(save_bitmap.GetHandle())
-        save_dc.DeleteDC()
-        mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
-
-        # Always output exact hardcoded resolution
-        if width != SCRCPY_WIDTH or height != SCRCPY_HEIGHT:
-            img = cv2.resize(img, (SCRCPY_WIDTH, SCRCPY_HEIGHT))
-
-        return img
-
-    except Exception as e:
+    """Capture the scrcpy window via capture_window_by_title + resize to expected resolution."""
+    img = capture_window_by_title("scrcpy")
+    if img is None:
         return None
+    h, w = img.shape[:2]
+    if w != SCRCPY_WIDTH or h != SCRCPY_HEIGHT:
+        img = cv2.resize(img, (SCRCPY_WIDTH, SCRCPY_HEIGHT))
+    return img
 
 def capture_thread(src, frame_q, proc, source_type="default"):
     
@@ -3460,9 +3710,8 @@ def display_thread(proc):
             else:
                 proc.cmd_console.add_output("❌ Face recognition unavailable (onnxruntime + ArcFace model required)")
         elif key == Config.Keybinds.KEY_SAFE_MODE:
-            global NAV_SAFE_MODE
-            NAV_SAFE_MODE = not NAV_SAFE_MODE
-            if NAV_SAFE_MODE:
+            now_safe = toggle_nav_safe_mode()
+            if now_safe:
                 proc.cmd_console.add_output("🛡️ Modo Seguro ACTIVADO — velocidades más lentas")
             else:
                 proc.cmd_console.add_output("⚙️ Modo Seguro DESACTIVADO — velocidades adaptativas")
@@ -3573,47 +3822,7 @@ def manual_control_loop(proc: VideoProcessor):
 #  MAIN
 # ==========================
 if __name__ == '__main__':
-    # Configuraciones por tipo de fuente (incluye modo de control)
-    # Primary use: DJI Spark drone via Android phone running DJI GO 4,
-    # captured wirelessly through scrcpy (phone plugged into DJI Controller).
-    SOURCE_CONFIGS = {
-        "default": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 5,
-            "target_fps": 30,
-            "control": "wifi"   # cámara local -> WiFi
-        },
-        "scrcpy": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 5,
-            "target_fps": 30,
-            "width": 2340,
-            "height": 1080,
-            "control": "serial"   # DJI Controller -> Serial
-        },
-        "smartview": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 3,
-            "target_fps": 30,
-            "control": "serial"   # DJI Controller -> Serial
-        },
-        "phone_stream": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 2,
-            "target_fps": 20,
-            "port": 8080,
-            "path": "/stream.mjpeg",
-            "control": "serial"   # DJI Controller -> Serial
-        },
-        "stream": {
-            "calibration": "calibration/calINSPIRO.npz",
-            "detection_interval": 1,
-            "target_fps": 15,
-            "url": f"http://{CamIP}/stream",
-            "control": "wifi",
-        }
-    }
-
+    # SOURCE_CONFIGS is defined at module level (single canonical location)
 
     # Solicitar modo LLM (ANTES de calibración)
     print("\nSelecciona el modelo de lenguaje (LLM):")

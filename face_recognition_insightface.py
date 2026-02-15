@@ -52,7 +52,12 @@ class ArcFaceONNX:
                 '~/.insightface/models/buffalo_l/w600k_r50.onnx'
             )
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"ArcFace model not found: {model_path}")
+            raise FileNotFoundError(
+                f"ArcFace model not found: {model_path}\n"
+                f"  Download it with: pip install insightface && "
+                f"python -c \"from insightface.app import FaceAnalysis; FaceAnalysis('buffalo_l')\"\n"
+                f"  Or manually place w600k_r50.onnx in: {os.path.dirname(model_path)}"
+            )
 
         # Prefer GPU, fallback to CPU
         providers = []
@@ -136,19 +141,56 @@ class FaceDatabase:
         if self.db_file.exists():
             try:
                 with open(self.db_file, 'rb') as f:
-                    self.people = pickle.load(f)
+                    data = pickle.load(f)
+                # Validate structure: must be dict[str, dict with 'embeddings' list]
+                if not isinstance(data, dict):
+                    raise ValueError(f"Expected dict, got {type(data).__name__}")
+                for name, entry in data.items():
+                    if not isinstance(entry, dict) or 'embeddings' not in entry:
+                        raise ValueError(f"Invalid entry for '{name}'")
+                self.people = data
                 print(f"[FaceDB] Loaded {len(self.people)} people "
                       f"({sum(len(v['embeddings']) for v in self.people.values())} embeddings)")
             except Exception as e:
                 print(f"[FaceDB] Load error: {e}, starting fresh")
+                # Keep corrupted file as backup for manual recovery
+                bak = self.db_file.with_suffix('.pkl.corrupted')
+                try:
+                    import shutil
+                    shutil.copy2(self.db_file, bak)
+                    print(f"[FaceDB] Corrupted file saved as {bak}")
+                except Exception:
+                    pass
                 self.people = {}
         else:
             print("[FaceDB] No existing database — starting fresh")
 
     def _save(self):
         try:
-            with open(self.db_file, 'wb') as f:
-                pickle.dump(self.people, f)
+            # Atomic write: write to temp file, then rename (prevents corruption on crash)
+            import tempfile
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.database_dir), suffix='.pkl.tmp'
+            )
+            try:
+                with os.fdopen(tmp_fd, 'wb') as f:
+                    pickle.dump(self.people, f)
+                # Keep one backup of the previous good database
+                if self.db_file.exists():
+                    bak = self.db_file.with_suffix('.pkl.bak')
+                    try:
+                        import shutil
+                        shutil.copy2(self.db_file, bak)
+                    except Exception:
+                        pass
+                os.replace(tmp_path, self.db_file)
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
         except Exception as e:
             print(f"[FaceDB] Save error: {e}")
 

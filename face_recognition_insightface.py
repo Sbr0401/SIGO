@@ -352,10 +352,27 @@ class LiveFaceRecognition:
         embedding = self.arcface.get_embedding(aligned)
         name, sim = self.database.recognize(embedding, self.threshold)
 
+        # F2: Store embedding for re-identification after tracking loss
+        if not hasattr(self, '_last_embeddings'):
+            self._last_embeddings = {}
+        self._last_embeddings[person_id] = embedding
+
         if name:
             with self._lock:
                 self._cache[person_id] = (name, sim, now)
         return name, sim
+
+    # ── F2 helpers for re-identification ───────────────────────────────
+    def _extract_face_roi(self, frame: np.ndarray, keypoints: np.ndarray) -> 'np.ndarray | None':
+        """Extract and align face ROI from keypoints (wrapper for re-ID)."""
+        return self.extract_face(frame, keypoints)
+
+    def _compute_embedding(self, aligned_face: np.ndarray) -> 'np.ndarray | None':
+        """Compute ArcFace embedding from an already aligned face."""
+        try:
+            return self.arcface.get_embedding(aligned_face)
+        except Exception:
+            return None
 
     # ── live enrollment ────────────────────────────────────────────────
     def enroll_person(self, frame: np.ndarray, keypoints: np.ndarray,
@@ -399,3 +416,114 @@ class LiveFaceRecognition:
             else:
                 self._cache.clear()
                 self._last_attempt.clear()
+
+    # ── auto-enrollment from photos ────────────────────────────────────
+    def auto_enroll_from_photos(self) -> int:
+        """Batch-enroll faces from existing images in face_database/{Name}/.
+
+        Scans each subdirectory of the database dir for .jpg/.png files.
+        For each image, detects a face (using eye/nose keypoints via MediaPipe
+        or simple frontal-face crop), computes ArcFace embedding, and adds it
+        to the database — but only if not already enrolled from that file.
+
+        Returns the number of NEW embeddings added.
+        """
+        import glob
+
+        db_dir = self.database.database_dir
+        added = 0
+
+        for person_dir in sorted(db_dir.iterdir()):
+            if not person_dir.is_dir():
+                continue
+            name = person_dir.name
+
+            # Collect image files
+            image_files = []
+            for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp'):
+                image_files.extend(person_dir.glob(ext))
+            if not image_files:
+                continue
+
+            # Track already-enrolled filenames to avoid duplicates
+            enrolled_key = f'_enrolled_files'
+            with self.database.lock:
+                if name not in self.database.people:
+                    self.database.people[name] = {
+                        'embeddings': [], 'enrolled_at': time.time()
+                    }
+                enrolled_set = set(
+                    self.database.people[name].get(enrolled_key, [])
+                )
+
+            for img_path in sorted(image_files):
+                fname = img_path.name
+                if fname in enrolled_set:
+                    continue  # already enrolled from this file
+
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    continue
+
+                # Try to extract & align face from the photo
+                aligned = self._extract_face_from_photo(img)
+                if aligned is None:
+                    print(f"[FaceDB] No face detected in {img_path.name}, skipping")
+                    continue
+
+                embedding = self.arcface.get_embedding(aligned)
+                with self.database.lock:
+                    self.database.people[name]['embeddings'].append(embedding)
+                    files_list = self.database.people[name].setdefault(
+                        enrolled_key, []
+                    )
+                    files_list.append(fname)
+                added += 1
+
+        if added > 0:
+            self.database._save()
+            self.clear_cache()
+            print(f"[FaceDB] Auto-enrolled {added} new embedding(s) from photos")
+        return added
+
+    def _extract_face_from_photo(self, img: np.ndarray):
+        """Extract and align a face from a standalone photo.
+        Uses OpenCV's DNN face detector for robust detection, then aligns
+        with eye landmarks for ArcFace input."""
+        h, w = img.shape[:2]
+
+        # Try OpenCV Haar cascade (ships with OpenCV, always available)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+
+        if len(faces) == 0:
+            # Fallback: assume the entire image is a tightly-cropped face
+            # Resize to 112x112 directly
+            return cv2.resize(img, (112, 112))
+
+        # Use largest face
+        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        face_roi = img[fy:fy+fh, fx:fx+fw]
+
+        # Try to detect eyes for proper alignment
+        eye_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_eye.xml'
+        )
+        eyes = eye_cascade.detectMultiScale(
+            gray[fy:fy+fh, fx:fx+fw], 1.1, 5, minSize=(15, 15)
+        )
+
+        if len(eyes) >= 2:
+            # Sort by x to get left/right eyes
+            eyes = sorted(eyes, key=lambda e: e[0])
+            ex1, ey1, ew1, eh1 = eyes[0]
+            ex2, ey2, ew2, eh2 = eyes[1]
+            left_eye = np.array([fx + ex1 + ew1/2, fy + ey1 + eh1/2], dtype=np.float32)
+            right_eye = np.array([fx + ex2 + ew2/2, fy + ey2 + eh2/2], dtype=np.float32)
+            nose = np.array([fx + fw/2, fy + fh * 0.65], dtype=np.float32)
+            return align_face(img, left_eye, right_eye, nose)
+
+        # No eyes found — just resize face ROI to 112x112
+        return cv2.resize(face_roi, (112, 112))

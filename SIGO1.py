@@ -48,6 +48,13 @@ except Exception:
 import serial
 import serial.tools.list_ports
 
+# Text-to-Speech for audio feedback (F4)
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
 # Facial recognition system (ArcFace via ONNX Runtime)
 try:
     from face_recognition_insightface import LiveFaceRecognition
@@ -131,6 +138,7 @@ except ImportError:
             KEY_CANCEL_NAV = '5'
             KEY_SAFE_MODE = ord('6')
             KEY_FACE_RECOGNITION = ord('4')
+            KEY_GESTURE_MODE = ord('8')
             KEY_MANUAL_TOGGLE = '7'
             KEY_MANUAL_EXIT = '7'
         class Performance:
@@ -218,6 +226,54 @@ def resolve_face_database_dir() -> str:
             return path
 
     return os.path.join(workspace_root, configured)
+
+# ==========================
+#  TTS (TEXT-TO-SPEECH) ENGINE
+# ==========================
+_tts_queue: Queue = Queue(maxsize=10)
+_tts_engine = None
+_tts_thread_started = False
+
+def _tts_worker():
+    """Background thread: reads text from _tts_queue and speaks it."""
+    global _tts_engine
+    try:
+        _tts_engine = pyttsx3.init()
+        _tts_engine.setProperty('rate', 170)   # Words per minute
+        _tts_engine.setProperty('volume', 0.9)
+        # Try to pick a female voice for variety
+        voices = _tts_engine.getProperty('voices')
+        for v in voices:
+            if 'female' in v.name.lower() or 'zira' in v.name.lower():
+                _tts_engine.setProperty('voice', v.id)
+                break
+    except Exception as e:
+        print(f"[TTS] Init failed: {e}")
+        return
+
+    while True:
+        try:
+            text = _tts_queue.get()
+            if text is None:
+                break  # Poison pill
+            _tts_engine.say(text)
+            _tts_engine.runAndWait()
+        except Exception:
+            pass  # Don't crash the TTS thread
+
+def tts_speak(text: str):
+    """Enqueue text for TTS playback (non-blocking). Drops if queue full."""
+    global _tts_thread_started
+    if not TTS_AVAILABLE:
+        return
+    if not _tts_thread_started:
+        _tts_thread_started = True
+        t = threading.Thread(target=_tts_worker, daemon=True)
+        t.start()
+    try:
+        _tts_queue.put_nowait(text)
+    except Full:
+        pass  # Drop oldest-intent rather than blocking
 
 # ==========================
 #  ARDUINO AUTO-DETECT & PROTOCOL
@@ -713,6 +769,84 @@ def distance_between_kpts(p1, p2):
 def _kpt_visible(kpts, idx):
     """Check if a keypoint is visible (above confidence threshold)"""
     return idx < len(kpts) and kpts[idx][2] > CONF_MIN_KPT
+
+# ==========================
+#  GESTURE RECOGNITION (F1)
+# ==========================
+# Gesture types detected from pose keypoints
+GESTURE_NONE = None
+GESTURE_HAND_RAISED = 'hand_raised'       # One hand above head → "come here"
+GESTURE_BOTH_HANDS_UP = 'both_hands_up'   # Both hands above head → "stop"
+GESTURE_WAVE = 'wave'                      # Wrist oscillation → "follow me"
+
+# Minimum frames a gesture must persist to be triggered (debounce)
+GESTURE_MIN_FRAMES = 5
+# Cooldown (seconds) between the same gesture triggering a command
+GESTURE_COOLDOWN = 4.0
+
+def detect_gesture(kpts, gesture_history: deque) -> Optional[str]:
+    """Detect a gesture from pose keypoints.
+
+    Args:
+        kpts: (17, 3) keypoints  (x, y, confidence)
+        gesture_history: deque(maxlen=10) of recent gesture strings (caller managed)
+
+    Returns:
+        Gesture string if a stable gesture is detected, else None.
+    """
+    gesture = GESTURE_NONE
+
+    has_nose = _kpt_visible(kpts, KPT_NOSE)
+    has_l_wri = _kpt_visible(kpts, KPT_L_WRI)
+    has_r_wri = _kpt_visible(kpts, KPT_R_WRI)
+    has_l_sh = _kpt_visible(kpts, KPT_L_SH)
+    has_r_sh = _kpt_visible(kpts, KPT_R_SH)
+
+    if not (has_nose and (has_l_sh or has_r_sh)):
+        gesture_history.append(GESTURE_NONE)
+        return GESTURE_NONE
+
+    nose_y = kpts[KPT_NOSE][1]
+
+    # Check wrists above nose (raised hand / both hands up)
+    l_above = has_l_wri and kpts[KPT_L_WRI][1] < nose_y
+    r_above = has_r_wri and kpts[KPT_R_WRI][1] < nose_y
+
+    if l_above and r_above:
+        gesture = GESTURE_BOTH_HANDS_UP
+    elif l_above or r_above:
+        gesture = GESTURE_HAND_RAISED
+
+    gesture_history.append(gesture)
+
+    # Debounce: require GESTURE_MIN_FRAMES consecutive identical gestures
+    if gesture and len(gesture_history) >= GESTURE_MIN_FRAMES:
+        recent = list(gesture_history)[-GESTURE_MIN_FRAMES:]
+        if all(g == gesture for g in recent):
+            return gesture
+
+    return GESTURE_NONE
+
+# ==========================
+#  OBSTACLE DETECTION CLASSES (F6)
+# ==========================
+# COCO class IDs for common obstacles (used by YOLO 80-class models)
+OBSTACLE_CLASSES = [
+    # Vehicles
+    2, 3, 5, 7,   # car, motorcycle, bus, truck
+    # Outdoor objects
+    9, 10, 11, 12, 13,  # traffic light, fire hydrant, stop sign, parking meter, bench
+    # Animals
+    15, 16, 17, 18, 19, 20, 21, 22, 23,  # cat through giraffe
+    # Furniture / indoor
+    56, 57, 58, 59, 60,  # chair, couch, potted plant, bed, dining table
+    # Electronics
+    62, 63, 72,  # tv, laptop, refrigerator
+    # Misc
+    24, 25, 28, 39, 64,  # backpack, umbrella, suitcase, bottle, mouse
+]
+OBSTACLE_DETECT_INTERVAL = 5   # Run obstacle detection every N frames
+OBSTACLE_CONFIDENCE = 0.40     # Lower threshold since we want safety-first
 
 def estimate_body_orientation(kpts):
     """
@@ -1249,6 +1383,23 @@ class VideoProcessor:
         # Face recognition results (person_id -> (name, confidence))
         self.face_identities = {}
         
+        # F1: Gesture recognition (toggled by hotkey)
+        self.gesture_mode = False
+        self.gesture_histories = {}       # person_id -> deque(maxlen=10) of gesture strings
+        self.gesture_cooldowns = {}       # person_id -> {gesture: last_trigger_time}
+        self.gesture_active = {}          # person_id -> current gesture string or None
+        
+        # F2: Person re-identification across tracking loss
+        self.lost_persons = {}            # person_id -> {face_emb, upper_color, lower_color, last_seen, identity}
+        self._reid_max_age = 30.0         # Max seconds to keep a lost person for matching
+        
+        # F4: TTS enabled flag (speaks navigation events)
+        self.tts_enabled = TTS_AVAILABLE
+        
+        # F6: Obstacle awareness
+        self.obstacle_detections = []     # [(class_name, bbox, confidence), ...]
+        self._obstacle_frame_counter = 0  # frame counter for throttled detection
+        
         # GUI
         self.console = ConsoleBuffer()       # System log (fast updates, detection info)
         self.cmd_console = ConsoleBuffer()   # Command console (user commands & responses)
@@ -1769,18 +1920,194 @@ class VideoProcessor:
                         'position_label': _position_label(ax_smooth),
                     }
         
-        # Remove old person detections that are no longer visible
+        # --- F2: Save lost persons for re-ID before removing ---
         with self.lock:
             for pid in list(self.history.keys()):
                 if pid.startswith('person_') and pid not in seen_persons:
                     if time.time() - self.history[pid].get('last_seen', 0) > self.expire_time:
+                        # Save face embedding + appearance for re-identification
+                        lost_data = self.history[pid]
+                        face_emb = None
+                        if self.face_system and pid in getattr(self.face_system, '_last_embeddings', {}):
+                            face_emb = self.face_system._last_embeddings[pid]
+                        self.lost_persons[pid] = {
+                            'face_emb': face_emb,
+                            'upper_color': lost_data.get('upper_color', 'unknown'),
+                            'lower_color': lost_data.get('lower_color', 'unknown'),
+                            'last_seen': lost_data.get('last_seen', time.time()),
+                            'identity': self.face_identities.get(pid),
+                        }
                         del self.history[pid]
                         self.face_identities.pop(pid, None)
-                        self.smooth.pop(pid, None)  # Clean up smoothing buffer too
+                        self.smooth.pop(pid, None)
+                        self.gesture_histories.pop(pid, None)
+                        self.gesture_cooldowns.pop(pid, None)
+                        self.gesture_active.pop(pid, None)
+        
+        # --- F2: Purge very old lost persons ---
+        now = time.time()
+        for pid in list(self.lost_persons.keys()):
+            if now - self.lost_persons[pid]['last_seen'] > self._reid_max_age:
+                del self.lost_persons[pid]
+
+        # --- F2: Attempt re-ID for newly appeared persons ---
+        self._attempt_reid(seen_persons)
+        
+        # --- F1: Gesture recognition (when enabled) ---
+        if self.gesture_mode:
+            self._process_gestures(seen_persons)
         
         # Face recognition on detected persons (uses keypoints — zero extra detection cost)
         if self.face_recognition_enabled and self.face_system:
             self._recognize_faces(frame, seen_persons)
+        
+        # --- F6: Obstacle detection (throttled) ---
+        self._obstacle_frame_counter += 1
+        if self._obstacle_frame_counter >= OBSTACLE_DETECT_INTERVAL:
+            self._obstacle_frame_counter = 0
+            self._detect_obstacles(frame)
+    
+    def _attempt_reid(self, seen_persons):
+        """F2: Try to match newly appeared persons against recently lost ones."""
+        if not self.lost_persons:
+            return
+        for pid in seen_persons:
+            # Only check persons that don't already have an identity
+            if pid in self.face_identities:
+                continue
+            data = self.history.get(pid)
+            if not data:
+                continue
+            
+            best_match_pid = None
+            best_score = 0.0
+            
+            for lost_pid, lost_data in self.lost_persons.items():
+                score = 0.0
+                checks = 0
+                
+                # Color matching (cheap)
+                if data.get('upper_color') != 'unknown' and lost_data.get('upper_color') != 'unknown':
+                    checks += 1
+                    if data['upper_color'] == lost_data['upper_color']:
+                        score += 0.3
+                if data.get('lower_color') != 'unknown' and lost_data.get('lower_color') != 'unknown':
+                    checks += 1
+                    if data['lower_color'] == lost_data['lower_color']:
+                        score += 0.2
+                
+                # Face embedding matching (expensive but accurate)
+                if lost_data.get('face_emb') is not None and self.face_system:
+                    # Try to get current person's face embedding
+                    kpts = data.get('keypoints')
+                    if kpts is not None and hasattr(self, '_raw_frame') and self._raw_frame is not None:
+                        try:
+                            raw = self._raw_frame
+                            face_roi = self.face_system._extract_face_roi(raw, kpts)
+                            if face_roi is not None:
+                                emb = self.face_system._compute_embedding(face_roi)
+                                if emb is not None:
+                                    sim = float(np.dot(emb, lost_data['face_emb']))
+                                    if sim > 0.3:
+                                        score += sim * 0.5  # Weight face heavily
+                                        checks += 1
+                        except Exception:
+                            pass
+                
+                if checks > 0 and score > best_score:
+                    best_score = score
+                    best_match_pid = lost_pid
+            
+            # Require minimum confidence for re-ID
+            if best_match_pid and best_score >= 0.4:
+                lost_identity = self.lost_persons[best_match_pid].get('identity')
+                if lost_identity:
+                    with self.lock:
+                        self.face_identities[pid] = lost_identity
+                    self.cmd_console.add_output(f"🔄 Re-ID: {pid} ← {best_match_pid} ({lost_identity[0]})")
+                del self.lost_persons[best_match_pid]
+    
+    def _process_gestures(self, seen_persons):
+        """F1: Detect gestures from keypoints and trigger actions."""
+        now = time.time()
+        for pid in seen_persons:
+            data = self.history.get(pid)
+            if not data or 'keypoints' not in data:
+                continue
+            kpts = data['keypoints']
+            
+            # Get or create gesture history for this person
+            if pid not in self.gesture_histories:
+                self.gesture_histories[pid] = deque(maxlen=10)
+            
+            gesture = detect_gesture(kpts, self.gesture_histories[pid])
+            self.gesture_active[pid] = gesture
+            
+            if gesture:
+                # Check cooldown
+                cooldowns = self.gesture_cooldowns.setdefault(pid, {})
+                last_trigger = cooldowns.get(gesture, 0)
+                if now - last_trigger < GESTURE_COOLDOWN:
+                    continue
+                cooldowns[gesture] = now
+                
+                # Trigger action based on gesture
+                person_num = pid.split('_')[1]
+                name_label = pid
+                if pid in self.face_identities:
+                    name_label = self.face_identities[pid][0]
+                
+                if gesture == GESTURE_BOTH_HANDS_UP:
+                    self.cmd_console.add_output(f"🙌 {name_label}: BOTH HANDS UP → Stop/Emergency")
+                    if self.tts_enabled:
+                        tts_speak(f"{name_label} signals stop")
+                    # Cancel active navigation
+                    if self.guided_mode:
+                        self.cmd_console.submit_command(Config.Keybinds.KEY_CANCEL_NAV)
+                        
+                elif gesture == GESTURE_HAND_RAISED:
+                    self.cmd_console.add_output(f"✋ {name_label}: HAND RAISED → Come here")
+                    if self.tts_enabled:
+                        tts_speak(f"{name_label} is calling")
+                    # Auto-navigate to that person
+                    self.cmd_console.submit_command(f"go to person {person_num}")
+    
+    def _detect_obstacles(self, frame):
+        """F6: Run YOLO obstacle detection for non-person objects."""
+        if self.yolo is None:
+            # Lazy load YOLO model
+            model_path = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            try:
+                self.yolo = YOLO(model_path)
+                self.object_classes = self.yolo.names
+            except Exception as e:
+                print(f"[F6] YOLO load failed: {e}")
+                return
+        
+        yolo_device = 0 if getattr(self, 'pose_device', None) == 'cuda' else 'cpu'
+        try:
+            results = self.yolo(frame, conf=OBSTACLE_CONFIDENCE, verbose=False,
+                                device=yolo_device, classes=OBSTACLE_CLASSES)
+        except Exception:
+            try:
+                results = self.yolo(frame, conf=OBSTACLE_CONFIDENCE, verbose=False,
+                                    device='cpu', classes=OBSTACLE_CLASSES)
+            except Exception:
+                return
+        
+        obstacles = []
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                cls_id = int(box.cls.cpu())
+                conf = float(box.conf.cpu())
+                cls_name = self.object_classes.get(cls_id, f"obj_{cls_id}")
+                obstacles.append((cls_name, (x1, y1, x2, y2), conf))
+        
+        with self.lock:
+            self.obstacle_detections = obstacles
     
     def _recognize_faces(self, frame, person_ids):
         """Recognise faces using pose keypoints + ArcFace embeddings."""
@@ -1881,6 +2208,18 @@ class VideoProcessor:
                 cv2.rectangle(out, (x1 - 1, ly - th - pad), (x1 + tw + pad * 2, ly + pad), accent, -1)
                 cv2.putText(out, full_label, (x1 + pad, ly), font, 0.65, (255, 255, 255), 2, LT)
                 
+                # F1: Gesture badge below bbox
+                gesture = self.gesture_active.get(mid)
+                if gesture and self.gesture_mode:
+                    gesture_labels = {
+                        GESTURE_HAND_RAISED: '✋ HAND RAISED',
+                        GESTURE_BOTH_HANDS_UP: '🙌 STOP',
+                        GESTURE_WAVE: '👋 WAVE',
+                    }
+                    g_label = gesture_labels.get(gesture, gesture)
+                    g_color = (0, 255, 255)  # Cyan
+                    cv2.putText(out, g_label, (x1, y2 + 20), font, 0.55, g_color, 2, LT)
+                
                 # Skeleton — single thin line per connection, no glow
                 if 'keypoints' in d:
                     kpts = d['keypoints']
@@ -1919,6 +2258,18 @@ class VideoProcessor:
                     if self.show_video_info:
                         lbl = f"{self.object_classes[obj['class_id']]} {obj['confidence']:.0%}"
                         cv2.putText(out, lbl, (ox1, oy1 - 6), font, 0.40, (255, 80, 80), 1, LT)
+
+        # --- F6: Render obstacle detections ---
+        with self.lock:
+            obstacles = list(self.obstacle_detections)
+        if obstacles:
+            for cls_name, (ox1, oy1, ox2, oy2), conf in obstacles:
+                cv2.rectangle(out, (ox1, oy1), (ox2, oy2), (0, 0, 255), 1, LT)
+                cv2.putText(out, f"! {cls_name} {conf:.0%}", (ox1, oy1 - 6), font, 0.40, (0, 0, 255), 1, LT)
+        
+        # --- F1: Gesture mode indicator ---
+        if self.gesture_mode:
+            cv2.putText(out, "GESTURE MODE ON", (w - 220, 30), font, 0.55, (0, 255, 255), 2, LT)
 
         self.processed_frame = out
         self._frame_gen += 1
@@ -3144,6 +3495,9 @@ def prompt_thread(proc):
             # Format target name
             if isinstance(chosen_id, str) and chosen_id.startswith('person_'):
                 target_name = f"Person {chosen_id.split('_')[1]}"
+                # Use face name if available
+                if chosen_id in proc.face_identities:
+                    target_name = proc.face_identities[chosen_id][0]
             else:
                 target_name = f"Marker {chosen_id}"
             
@@ -3152,6 +3506,10 @@ def prompt_thread(proc):
    Distancia: {marker_info.get('distance', 0):.2f}m
    Dirección: X:{marker_info.get('angle_x', 0):+.1f}° Y:{marker_info.get('angle_y', 0):+.1f}°
 """)
+            # F4: TTS announce navigation start
+            if proc.tts_enabled:
+                mode_word = "Following" if follow else "Navigating to"
+                tts_speak(f"{mode_word} {target_name}")
         
         # Bucle de navegación
         connection_lost_time = None
@@ -3164,6 +3522,8 @@ def prompt_thread(proc):
             while not proc.stop_event.is_set():
                 if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV):
                     proc.cmd_console.add_output(f"🛑 MODO NAVEGACIÓN CANCELADO (tecla {Config.Keybinds.KEY_CANCEL_NAV.upper()})")
+                    if proc.tts_enabled:
+                        tts_speak("Navigation cancelled")
                     break
                     
                 with proc.lock:
@@ -3179,12 +3539,25 @@ def prompt_thread(proc):
                         proc.cmd_console.add_output("⚠️ Objetivo perdido, buscando...")
                     elif time.time() - connection_lost_time > MAX_CONNECTION_LOSS:
                         proc.cmd_console.add_output("❌ El objetivo se perdió por más de 3 segundos")
+                        if proc.tts_enabled:
+                            tts_speak("Target lost")
                         break
                     time.sleep(0.1)
                     continue
                         
                 nav_info = print_navigation_commands({'id': chosen_id, **marker_data}, DISTANCE_TARGET, follow)
                 proc.console.add_output(nav_info)
+                
+                # F6: Warn about obstacles in path during navigation
+                with proc.lock:
+                    nav_obstacles = list(proc.obstacle_detections)
+                if nav_obstacles and not hasattr(proc, '_last_obstacle_warn') or \
+                   (nav_obstacles and time.time() - getattr(proc, '_last_obstacle_warn', 0) > 5.0):
+                    obstacle_names = list(set(o[0] for o in nav_obstacles[:3]))
+                    proc.cmd_console.add_output(f"⚠️ Obstacles detected: {', '.join(obstacle_names)}")
+                    if proc.tts_enabled:
+                        tts_speak(f"Warning, {obstacle_names[0]} ahead")
+                    proc._last_obstacle_warn = time.time()
                 
                 try:
                     send_commands_byte({'id': chosen_id, **marker_data}, DISTANCE_TARGET)
@@ -3204,6 +3577,8 @@ def prompt_thread(proc):
                 if not follow:
                     if marker_data['distance'] <= DISTANCE_TARGET:
                         proc.cmd_console.add_output("✅ OBJETIVO ALCANZADO")
+                        if proc.tts_enabled:
+                            tts_speak("Target reached")
                         break
                         
                 time.sleep(0.5)
@@ -3683,8 +4058,13 @@ def display_thread(proc):
                             proc.face_system = LiveFaceRecognition(
                                 database_dir=db_dir
                             )
+                            # Auto-enroll from existing photos in face_database/{Name}/
+                            auto_count = proc.face_system.auto_enroll_from_photos()
                             people = proc.face_system.list_people()
-                            proc.cmd_console.add_output(f"✅ Face recognition ON ({len(people)} enrolled)")
+                            msg = f"✅ Face recognition ON ({len(people)} enrolled)"
+                            if auto_count > 0:
+                                msg += f" (+{auto_count} from photos)"
+                            proc.cmd_console.add_output(msg)
                             proc.cmd_console.add_output(f"   DB: {db_dir}")
                         except Exception as e:
                             proc.cmd_console.add_output(f"❌ Face recognition error: {e}")
@@ -3702,6 +4082,17 @@ def display_thread(proc):
                 proc.cmd_console.add_output("🛡️ Modo Seguro ACTIVADO — velocidades más lentas")
             else:
                 proc.cmd_console.add_output("⚙️ Modo Seguro DESACTIVADO — velocidades adaptativas")
+        elif key == getattr(Config.Keybinds, 'KEY_GESTURE_MODE', ord('8')):
+            proc.gesture_mode = not proc.gesture_mode
+            if proc.gesture_mode:
+                proc.cmd_console.add_output("🤚 Gesture recognition ON (hand raised = come here, both hands = stop)")
+                if proc.tts_enabled:
+                    tts_speak("Gesture mode activated")
+            else:
+                proc.cmd_console.add_output("🤚 Gesture recognition OFF")
+                proc.gesture_active.clear()
+                if proc.tts_enabled:
+                    tts_speak("Gesture mode deactivated")
         elif key in Config.Keybinds.KEY_ARROW_PREFIX:
             key2 = cv2.waitKey(1) & 0xFF
             if key2 == Config.Keybinds.KEY_ARROW_UP:
@@ -3716,6 +4107,7 @@ def display_thread(proc):
                 ord(Config.Keybinds.KEY_CANCEL_NAV),         # 5
                 Config.Keybinds.KEY_SAFE_MODE,               # 6
                 ord(Config.Keybinds.KEY_MANUAL_TOGGLE),      # 7
+                getattr(Config.Keybinds, 'KEY_GESTURE_MODE', ord('8')),  # 8
             }
             if key not in hotkey_codes:
                 proc.cmd_console.add_to_input(chr(key))
@@ -4016,6 +4408,8 @@ if __name__ == '__main__':
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = Cancelar navegación")
     proc.cmd_console.add_output(f"   6 = Toggle Modo Seguro (velocidad mínima)")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
+    proc.cmd_console.add_output(f"   8 = Toggle gesture recognition")
+    proc.cmd_console.add_output(f"   TTS: {'ON' if proc.tts_enabled else 'OFF (pyttsx3 not installed)'}")
     proc.cmd_console.add_output("")
 
     # ─── Auto-load face recognition (ArcFace via ONNX) ────────────────

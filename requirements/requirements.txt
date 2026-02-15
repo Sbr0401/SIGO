@@ -51,6 +51,9 @@ sounddevice>=0.5.1
 pyserial>=3.5
 keyboard>=0.13.5
 
+# Text-to-Speech (F4: audio feedback)
+pyttsx3>=2.90
+
 # Windows-specific (scrcpy support)
 pywin32>=308; sys_platform == 'win32'
 

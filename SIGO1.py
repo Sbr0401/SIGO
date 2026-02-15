@@ -780,9 +780,11 @@ GESTURE_BOTH_HANDS_UP = 'both_hands_up'   # Both hands above head → "stop"
 GESTURE_WAVE = 'wave'                      # Wrist oscillation → "follow me"
 
 # Minimum frames a gesture must persist to be triggered (debounce)
-GESTURE_MIN_FRAMES = 5
+GESTURE_MIN_FRAMES = 8
 # Cooldown (seconds) between the same gesture triggering a command
-GESTURE_COOLDOWN = 4.0
+GESTURE_COOLDOWN = 10.0
+# Minimum keypoint confidence for wrist/elbow in gesture detection
+GESTURE_KPT_CONF = 0.5
 
 def detect_gesture(kpts, gesture_history: deque, bbox=None) -> Optional[str]:
     """Detect a gesture from pose keypoints.
@@ -822,15 +824,25 @@ def detect_gesture(kpts, gesture_history: deque, bbox=None) -> Optional[str]:
     else:
         x_lo, x_hi = -1e9, 1e9
 
+    # Compute minimum vertical margin: wrist must be at least this far
+    # above the nose to count as "raised".  Uses the shoulder-to-nose
+    # distance as a body-relative ruler (≈ head height).
+    ref_sh_idx = KPT_L_SH if has_l_sh else KPT_R_SH
+    sh_y = kpts[ref_sh_idx][1]
+    head_height = abs(sh_y - nose_y)  # shoulder-to-nose in pixels
+    # Require wrist to be at least 0.6× head_height ABOVE the nose
+    min_raise = max(head_height * 0.6, 15)  # at least 15px to guard tiny detections
+
     def _wrist_valid(wrist_idx, shoulder_idx, elbow_idx):
-        """Check that a wrist is above the nose AND plausibly belongs to
-        this person: it must be horizontally within the expanded bbox
-        and connected through a visible arm chain (shoulder→elbow→wrist)."""
-        if not _kpt_visible(kpts, wrist_idx):
+        """Check that a wrist is significantly above the nose AND plausibly
+        belongs to this person: it must be horizontally within the expanded
+        bbox and connected through a visible arm chain."""
+        # Require higher confidence for gesture wrists
+        if wrist_idx >= len(kpts) or kpts[wrist_idx][2] < GESTURE_KPT_CONF:
             return False
         wx, wy = kpts[wrist_idx][0], kpts[wrist_idx][1]
-        # Must be above nose
-        if wy >= nose_y:
+        # Must be significantly above nose (not just 1-2 pixels from jitter)
+        if wy >= nose_y - min_raise:
             return False
         # Horizontal containment: reject wrists far outside this person's box
         if wx < x_lo or wx > x_hi:

@@ -567,7 +567,7 @@ class ConsoleBuffer:
         self.command_history = deque(maxlen=max_history)
         self.history_index = -1
         self.lock = threading.Lock()
-        self._cmd_counter = 0  # Monotonic counter for unique command IDs
+        self.cmd_queue = Queue()  # Thread-safe command queue for prompt_thread
         
     def add_output(self, text):
         with self.lock:
@@ -618,6 +618,13 @@ class ConsoleBuffer:
             elif self.history_index == 0:
                 self.history_index = -1
                 self.current_input = ""
+
+    def submit_command(self, text):
+        """Submit a command: display it, record in history, enqueue for prompt_thread."""
+        self.add_output(f"> {text}")
+        self.add_to_history(text)
+        self.cmd_queue.put(text)
+        self.clear_input()
 
 # ==========================
 #  UTIL
@@ -2552,10 +2559,7 @@ def voice_input_thread(proc: VideoProcessor):
             if texto and texto.strip():
                 print(f"[VOZ] {texto}")
                 proc.cmd_console.add_output(f"[VOZ] {texto}")
-                proc.cmd_console.add_output(f"> {texto}")
-                with proc.lock:
-                    proc.cmd_console._cmd_counter += 1  # Trigger prompt_thread
-                proc.cmd_console.clear_input()
+                proc.cmd_console.submit_command(texto)
             else:
                 print("🤷 No se detectó ningún texto.")
                 proc.cmd_console.add_output("🤷 No se detectó ningún texto.")
@@ -2760,24 +2764,13 @@ def _resolve_name_to_person(proc, name: str):
 #  PROMPT THREAD (SELECCIÓN Y NAVEGACIÓN)
 # ==========================
 def prompt_thread(proc):
-    """Hilo mejorado con mayor feedback visual"""
-    _last_processed_counter = -1  # Track last processed command counter (not text)
+    """Command consumer: reads from cmd_queue (Queue) instead of scanning console buffer."""
     while not proc.stop_event.is_set():
-        time.sleep(0.5)
-        
-        last_command = None
-        current_counter = -1
-        with proc.lock:
-            buf = proc.cmd_console.get_visible_buffer()
-            current_counter = proc.cmd_console._cmd_counter
-            for line in reversed(buf):
-                if line.startswith("> "):
-                    last_command = line[2:]
-                    break
-        
-        if not last_command or current_counter == _last_processed_counter:
+        # Block on queue with timeout so we can check stop_event periodically
+        try:
+            last_command = proc.cmd_console.cmd_queue.get(timeout=0.5)
+        except Empty:
             continue
-        _last_processed_counter = current_counter
 
         # ─── Handle pending enrollment confirmation ─────────────────
         if proc.pending_enrollment is not None:
@@ -3679,11 +3672,7 @@ def display_thread(proc):
         elif key == Config.Keybinds.KEY_ENTER:
             if proc.cmd_console.get_input():
                 cmd = proc.cmd_console.get_input()
-                proc.cmd_console.add_output(f"> {cmd}")
-                proc.cmd_console.add_to_history(cmd)
-                with proc.lock:
-                    proc.cmd_console._cmd_counter += 1  # Bump counter so prompt_thread sees new command
-                proc.cmd_console.clear_input()
+                proc.cmd_console.submit_command(cmd)
         elif key == Config.Keybinds.KEY_FACE_RECOGNITION:
             # Toggle face recognition on/off
             if FACE_RECOGNITION_AVAILABLE:

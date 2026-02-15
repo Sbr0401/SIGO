@@ -3569,13 +3569,6 @@ def processing_worker(proc, frame_q):
     process_count = 0
     last_fps_check = time.time()
     
-    # Cache config lookups once
-    _perf = getattr(Config, 'Performance', None)
-    fps_low = getattr(_perf, 'FPS_LOW_THRESHOLD', 0.8)
-    fps_high = getattr(_perf, 'FPS_HIGH_THRESHOLD', 1.2)
-    min_interval = getattr(_perf, 'MIN_DETECTION_INTERVAL', 1)
-    max_interval = getattr(_perf, 'MAX_DETECTION_INTERVAL', 10)
-    
     while not proc.stop_event.is_set():
         try:
             frame = frame_q.get(timeout=0.05)
@@ -3595,17 +3588,10 @@ def processing_worker(proc, frame_q):
                 import traceback
                 traceback.print_exc()
         
-        # FPS auto-adjust check (every second)
+        # FPS monitoring (every second) — detection_interval is vestigial
+        # because ByteTrack requires .track() every frame for ID continuity.
         now = time.time()
         if now - last_fps_check > 1.0:
-            actual_fps = process_count / (now - last_fps_check)
-            
-            if not getattr(proc, 'disable_auto_adjust', False):
-                if actual_fps < proc.target_fps * fps_low:
-                    proc.detection_interval = min(max_interval, proc.detection_interval + 1)
-                elif actual_fps > proc.target_fps * fps_high:
-                    proc.detection_interval = max(min_interval, proc.detection_interval - 1)
-            
             process_count = 0
             last_fps_check = now
 

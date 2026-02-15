@@ -216,10 +216,14 @@ class FaceDatabase:
         best_name, best_sim = None, -1.0
         with self.lock:
             for name, data in self.people.items():
-                for db_emb in data['embeddings']:
-                    sim = float(np.dot(embedding, db_emb))
-                    if sim > best_sim:
-                        best_sim, best_name = sim, name
+                embs = data['embeddings']
+                if not embs:
+                    continue
+                # Vectorized dot product: (N, 512) @ (512,) → (N,) similarities
+                sims = np.dot(np.array(embs), embedding)
+                max_sim = float(sims.max())
+                if max_sim > best_sim:
+                    best_sim, best_name = max_sim, name
         if best_sim >= threshold:
             return best_name, best_sim
         return None, 0.0

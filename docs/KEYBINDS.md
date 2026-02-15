@@ -41,15 +41,15 @@ Todos los keybinds se pueden modificar en **`config.py`** → Clase **`KeybindCo
 | **7** (en consola) | Activar/desactivar modo manual | `KEY_MANUAL_TOGGLE = '7'` |
 | **7** (en modo manual) | Salir del modo manual | `KEY_MANUAL_EXIT = '7'` |
 
-### Controles de Vuelo
+### Controles de Movimiento
 | Tecla | Función | Bit | Config Variable |
-|-------|---------|-----|-----------------|
-| **J** | Rotar izquierda (CCW) | 0 | `MANUAL_ROTATE_CCW = 'j'` |
-| **L** | Rotar derecha (CW) | 1 | `MANUAL_ROTATE_CW = 'l'` |
-| **I** | Subir | 2 | `MANUAL_UP = 'i'` |
-| **K** | Bajar | 3 | `MANUAL_DOWN = 'k'` |
+|-------|---------|-----|------------------|
+| **J** | Rotar anti-horario (CCW) | 0 | `MANUAL_ROTATE_CCW = 'j'` |
+| **L** | Rotar horario (CW) | 1 | `MANUAL_ROTATE_CW = 'l'` |
+| **I** | Izquierda | 2 | `MANUAL_UP = 'i'` |
+| **K** | Derecha | 3 | `MANUAL_DOWN = 'k'` |
 | **U** | Avanzar | 4 | `MANUAL_FORWARD = 'u'` |
-| **O** | Retroceder/Despegar | 5 | `MANUAL_BACK = 'o'` |
+| **O** | Retroceder | 5 | `MANUAL_BACK = 'o'` |
 | **P** | Reservado | 6 | `MANUAL_RESERVED = 'p'` |
 | **F** | Velocidad rápida | 7 | `MANUAL_FAST = 'f'` |
 
@@ -72,8 +72,8 @@ class KeybindConfig:
     # Cambiar controles manuales (ejemplo: WASD style)
     MANUAL_ROTATE_CCW = 'a'  # En lugar de 'j'
     MANUAL_ROTATE_CW = 'd'   # En lugar de 'l'
-    MANUAL_UP = 'w'          # En lugar de 'i'
-    MANUAL_DOWN = 's'        # En lugar de 'k'
+    MANUAL_UP = 'w'          # Izquierda, en lugar de 'i'
+    MANUAL_DOWN = 's'        # Derecha, en lugar de 'k'
     MANUAL_FORWARD = 'e'     # En lugar de 'u'
     MANUAL_BACK = 'q'        # En lugar de 'o'
     

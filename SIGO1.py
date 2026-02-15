@@ -71,7 +71,7 @@ except ImportError:
     # Fallback to inline config if config.py missing
     class Config:
         class Hardware:
-            SERIAL_PORT = 'COM8'
+            SERIAL_PORT = 'auto'
             SERIAL_BAUD = 9600
             SERIAL_TIMEOUT = 1
             SERIAL_RECONNECT_GRACE = 15
@@ -602,7 +602,7 @@ if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
 else:
     SOURCE_CONFIGS = {
         "default": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "wifi"},
-        "scrcpy":  {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "width": 2340, "height": 1080, "control": "serial"},
+        "scrcpy":  {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 5, "target_fps": 30, "control": "serial"},
         "smartview": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 3, "target_fps": 30, "control": "serial"},
         "phone_stream": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 2, "target_fps": 20, "port": 8080, "path": "/stream.mjpeg", "control": "serial"},
         "stream": {"calibration": "calibration/calINSPIRO.npz", "detection_interval": 1, "target_fps": 15, "url": f"http://{CamIP}/stream", "control": "wifi"},
@@ -3631,8 +3631,9 @@ def prompt_thread(proc):
 # ==========================
 
 # Hardcoded scrcpy capture resolution — aligned to calibration/calINSPIRO.npz
-SCRCPY_WIDTH  = 2340
-SCRCPY_HEIGHT = 1080
+# Loaded from config.py SourceConfig; fallback to 2340x1080
+SCRCPY_WIDTH  = getattr(getattr(Config, 'Source', None), 'SCRCPY_WIDTH', 2340)
+SCRCPY_HEIGHT = getattr(getattr(Config, 'Source', None), 'SCRCPY_HEIGHT', 1080)
 
 # PrintWindow flags — capture window content even when behind other windows
 PW_CLIENTONLY = 1           # Capture client area only (no title bar)

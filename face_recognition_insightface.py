@@ -52,12 +52,20 @@ class ArcFaceONNX:
                 '~/.insightface/models/buffalo_l/w600k_r50.onnx'
             )
         if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"ArcFace model not found: {model_path}\n"
-                f"  Download it with: pip install insightface && "
-                f"python -c \"from insightface.app import FaceAnalysis; FaceAnalysis('buffalo_l')\"\n"
-                f"  Or manually place w600k_r50.onnx in: {os.path.dirname(model_path)}"
-            )
+            # Auto-download from HuggingFace
+            print(f"[FaceRec] ArcFace model not found. Downloading w600k_r50.onnx (~174MB)...")
+            try:
+                import urllib.request
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                url = "https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx"
+                urllib.request.urlretrieve(url, model_path)
+                print(f"[FaceRec] Downloaded ArcFace model to: {model_path}")
+            except Exception as dl_err:
+                raise FileNotFoundError(
+                    f"ArcFace model not found and auto-download failed: {dl_err}\n"
+                    f"  Download manually from: https://huggingface.co/deepinsight/insightface\n"
+                    f"  Place w600k_r50.onnx in: {os.path.dirname(model_path)}"
+                )
 
         # Prefer GPU, fallback to CPU
         providers = []

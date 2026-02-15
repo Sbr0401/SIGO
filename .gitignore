@@ -21,14 +21,16 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# YOLO model weights (large, download separately)
-*.pt
+# YOLO model weights (auto-downloaded by Ultralytics on first run)
+# *.pt  — NOT ignored: yolov8s-pose.pt ships with the repo for offline use
 
-# Face database (user-specific enrolled faces)
-face_database/
+# Face database (user-specific enrolled faces — starts empty)
+face_database/*.pkl
+face_database/*.pkl.bak
+face_database_test/
 
-# Calibration data (camera-specific)
-calibration/*.npz
+# Calibration data (camera-specific — ships with repo for reference)
+# calibration/*.npz  — NOT ignored: ships with repo
 calibration/*.jpg
 
 # Legacy files (replaced by face_recognition_insightface.py)

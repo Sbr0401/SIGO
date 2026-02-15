@@ -94,7 +94,15 @@ if errorlevel 1 (
 )
 
 echo.
-echo  [4/4] Verificando instalacion...
+echo  [4/4] Descargando modelo ArcFace (reconocimiento facial)...
+python -c "import os, urllib.request; d=os.path.expanduser('~/.insightface/models/buffalo_l'); os.makedirs(d,exist_ok=True); f=os.path.join(d,'w600k_r50.onnx'); (print('[OK] ArcFace ya descargado') if os.path.exists(f) else (print('Descargando w600k_r50.onnx (~174MB)...'), urllib.request.urlretrieve('https://huggingface.co/deepinsight/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx',f), print('[OK] ArcFace descargado')))" 2>nul
+if errorlevel 1 (
+    echo  [WARN] No se pudo descargar ArcFace automaticamente
+    echo  Se descargara al primer uso del reconocimiento facial
+)
+
+echo.
+echo  Verificando instalacion...
 python -c "import cv2, ultralytics, torch; print('[OK] Instalacion exitosa')"
 
 echo.

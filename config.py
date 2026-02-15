@@ -130,6 +130,10 @@ class VisionConfig:
 # ==========================
 class SourceConfig:
     """Video source specific settings"""
+    # Scrcpy capture resolution (set to your phone's resolution, or 0 for auto)
+    SCRCPY_WIDTH = 2340
+    SCRCPY_HEIGHT = 1080
+    
     SOURCES = {
         "default": {
             "calibration": "calibration/calINSPIRO.npz",
@@ -141,6 +145,20 @@ class SourceConfig:
             "calibration": "calibration/calINSPIRO.npz",
             "detection_interval": 5,
             "target_fps": 30,
+            "control": "serial"
+        },
+        "smartview": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 3,
+            "target_fps": 30,
+            "control": "serial"
+        },
+        "phone_stream": {
+            "calibration": "calibration/calINSPIRO.npz",
+            "detection_interval": 2,
+            "target_fps": 20,
+            "port": 8080,
+            "path": "/stream.mjpeg",
             "control": "serial"
         },
         "stream": {

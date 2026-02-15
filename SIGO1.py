@@ -1388,6 +1388,7 @@ class VideoProcessor:
         self.gesture_histories = {}       # person_id -> deque(maxlen=10) of gesture strings
         self.gesture_cooldowns = {}       # person_id -> {gesture: last_trigger_time}
         self.gesture_active = {}          # person_id -> current gesture string or None
+        self.gesture_nav_target = None    # person_id currently being navigated to via gesture
         
         # F2: Person re-identification across tracking loss
         self.lost_persons = {}            # person_id -> {face_emb, upper_color, lower_color, last_seen, identity}
@@ -2028,49 +2029,71 @@ class VideoProcessor:
                 del self.lost_persons[best_match_pid]
     
     def _process_gestures(self, seen_persons):
-        """F1: Detect gestures from keypoints and trigger actions."""
+        """F1: Detect gestures from keypoints and trigger actions.
+
+        HAND_RAISED behaviour:
+        - One-shot trigger: starts navigation to the calling person
+        - Navigation persists even after the hand is lowered
+        - Stops automatically at DISTANCE_TARGET (approach mode, no follow)
+        - Only cancelled by BOTH_HANDS_UP from any visible person
+        """
         now = time.time()
+
+        # Clear gesture_nav_target when navigation has ended
+        if self.gesture_nav_target and not self.guided_mode:
+            self.gesture_nav_target = None
+
         for pid in seen_persons:
             data = self.history.get(pid)
             if not data or 'keypoints' not in data:
                 continue
             kpts = data['keypoints']
-            
+
             # Get or create gesture history for this person
             if pid not in self.gesture_histories:
                 self.gesture_histories[pid] = deque(maxlen=10)
-            
+
             gesture = detect_gesture(kpts, self.gesture_histories[pid])
             self.gesture_active[pid] = gesture
-            
-            if gesture:
-                # Check cooldown
+
+            # --- BOTH_HANDS_UP: always processed (cancels gesture nav) ---
+            if gesture == GESTURE_BOTH_HANDS_UP:
                 cooldowns = self.gesture_cooldowns.setdefault(pid, {})
                 last_trigger = cooldowns.get(gesture, 0)
                 if now - last_trigger < GESTURE_COOLDOWN:
                     continue
                 cooldowns[gesture] = now
-                
-                # Trigger action based on gesture
+
+                name_label = self.face_identities[pid][0] if pid in self.face_identities else pid
+                self.cmd_console.add_output(f"🙌 {name_label}: BOTH HANDS UP → Stop/Emergency")
+                if self.tts_enabled:
+                    tts_speak(f"{name_label} signals stop")
+                if self.guided_mode:
+                    self.gesture_nav_target = None
+                    self.cmd_console.submit_command(Config.Keybinds.KEY_CANCEL_NAV)
+                continue
+
+            # --- HAND_RAISED: one-shot persistent navigation trigger ---
+            if gesture == GESTURE_HAND_RAISED:
+                # Skip if we're already navigating to someone via gesture
+                if self.gesture_nav_target and self.guided_mode:
+                    continue
+
+                cooldowns = self.gesture_cooldowns.setdefault(pid, {})
+                last_trigger = cooldowns.get(gesture, 0)
+                if now - last_trigger < GESTURE_COOLDOWN:
+                    continue
+                cooldowns[gesture] = now
+
                 person_num = pid.split('_')[1]
-                name_label = pid
-                if pid in self.face_identities:
-                    name_label = self.face_identities[pid][0]
-                
-                if gesture == GESTURE_BOTH_HANDS_UP:
-                    self.cmd_console.add_output(f"🙌 {name_label}: BOTH HANDS UP → Stop/Emergency")
-                    if self.tts_enabled:
-                        tts_speak(f"{name_label} signals stop")
-                    # Cancel active navigation
-                    if self.guided_mode:
-                        self.cmd_console.submit_command(Config.Keybinds.KEY_CANCEL_NAV)
-                        
-                elif gesture == GESTURE_HAND_RAISED:
-                    self.cmd_console.add_output(f"✋ {name_label}: HAND RAISED → Come here")
-                    if self.tts_enabled:
-                        tts_speak(f"{name_label} is calling")
-                    # Auto-navigate to that person
-                    self.cmd_console.submit_command(f"go to person {person_num}")
+                name_label = self.face_identities[pid][0] if pid in self.face_identities else pid
+                self.cmd_console.add_output(f"✋ {name_label}: HAND RAISED → Navigating to them")
+                if self.tts_enabled:
+                    tts_speak(f"{name_label} is calling")
+
+                # Mark as gesture-initiated navigation (persists after hand lowered)
+                self.gesture_nav_target = pid
+                self.cmd_console.submit_command(f"go to person {person_num}")
     
     def _detect_obstacles(self, frame):
         """F6: Run YOLO obstacle detection for non-person objects."""
@@ -2209,16 +2232,23 @@ class VideoProcessor:
                 cv2.putText(out, full_label, (x1 + pad, ly), font, 0.65, (255, 255, 255), 2, LT)
                 
                 # F1: Gesture badge below bbox
-                gesture = self.gesture_active.get(mid)
-                if gesture and self.gesture_mode:
-                    gesture_labels = {
-                        GESTURE_HAND_RAISED: '✋ HAND RAISED',
-                        GESTURE_BOTH_HANDS_UP: '🙌 STOP',
-                        GESTURE_WAVE: '👋 WAVE',
-                    }
-                    g_label = gesture_labels.get(gesture, gesture)
-                    g_color = (0, 255, 255)  # Cyan
-                    cv2.putText(out, g_label, (x1, y2 + 20), font, 0.55, g_color, 2, LT)
+                if self.gesture_mode:
+                    gesture = self.gesture_active.get(mid)
+                    is_gesture_target = (self.gesture_nav_target == mid and self.guided_mode)
+                    if gesture or is_gesture_target:
+                        if is_gesture_target and not gesture:
+                            # Hand lowered but still navigating to them
+                            g_label = '>> NAVIGATING'
+                            g_color = (0, 200, 0)  # Green
+                        else:
+                            gesture_labels = {
+                                GESTURE_HAND_RAISED: '✋ HAND RAISED',
+                                GESTURE_BOTH_HANDS_UP: '🙌 STOP',
+                                GESTURE_WAVE: '👋 WAVE',
+                            }
+                            g_label = gesture_labels.get(gesture, gesture)
+                            g_color = (0, 255, 255)  # Cyan
+                        cv2.putText(out, g_label, (x1, y2 + 20), font, 0.55, g_color, 2, LT)
                 
                 # Skeleton — single thin line per connection, no glow
                 if 'keypoints' in d:

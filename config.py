@@ -242,6 +242,7 @@ class KeybindConfig:
     # Feature toggles
     KEY_FACE_RECOGNITION = ord('4')  # Toggle face recognition
     KEY_GESTURE_MODE = ord('8')      # Toggle gesture recognition (F1)
+    KEY_FIND_PERSON = ord('9')       # Find person by name (360° scan)
     
     # Mode switching
     KEY_MANUAL_TOGGLE = '7'  # Toggle manual control mode

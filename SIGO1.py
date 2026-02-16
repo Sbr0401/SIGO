@@ -1463,6 +1463,8 @@ class VideoProcessor:
         self.gesture_active = {}          # person_id -> current gesture string or None
         self.gesture_nav_target = None    # person_id currently being navigated to via gesture
         self.cancel_nav_event = threading.Event()  # set by gesture BOTH_HANDS_UP to cancel navigation
+        self._find_person_pending = False  # True when waiting for name input after hotkey 9
+        self._find_person_choice = None   # person_id waiting for go/follow response
         
         # F4: TTS enabled flag (speaks navigation events)
         self.tts_enabled = TTS_AVAILABLE
@@ -3139,6 +3141,85 @@ def _resolve_name_to_person(proc, name: str):
     return None
 
 # ==========================
+#  FIND PERSON (360° SCAN)
+# ==========================
+# Duration (seconds) for one full slow rotation (CW level 1).
+# Adjust if the physical platform rotates faster or slower.
+FIND_SCAN_DURATION = 18.0
+# Interval between checks during scan (seconds)
+FIND_SCAN_CHECK_INTERVAL = 0.4
+
+def _find_person_scan(proc, name: str):
+    """Rotate slowly (CW level 1) for up to FIND_SCAN_DURATION seconds,
+    checking face_identities every FIND_SCAN_CHECK_INTERVAL for *name*.
+    If found, stop and prompt follow/go-to.  If not found after a full
+    rotation, stop and report."""
+    found_pid = None
+    try:
+        open_port()
+        start = time.time()
+        # Slow CW rotation: channel 1 (CW) at magnitude 1
+        b1, b2 = encode_arduino_pair(cw=1)
+
+        while not proc.stop_event.is_set():
+            elapsed = time.time() - start
+            if elapsed >= FIND_SCAN_DURATION:
+                break
+
+            # Check if target is visible
+            with proc.lock:
+                for pid, (face_name, _sim) in list(proc.face_identities.items()):
+                    if face_name.lower() == name.lower() and pid in proc.history:
+                        found_pid = pid
+                        break
+
+            if found_pid:
+                break
+
+            # Cancel if user presses 5
+            if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV):
+                proc.cmd_console.add_output("🛑 Find scan cancelled.")
+                if proc.tts_enabled:
+                    tts_speak("Search cancelled")
+                return
+
+            # Send slow rotation command
+            control.send(b1, b2)
+            time.sleep(FIND_SCAN_CHECK_INTERVAL)
+
+        # Stop rotation
+        control.send(0, 0)
+
+    except Exception as e:
+        proc.cmd_console.add_output(f"❌ Find scan error: {e}")
+        try:
+            control.send(0, 0)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            close_port()
+        except Exception:
+            pass
+
+    if found_pid:
+        person_num = found_pid.split('_')[1]
+        dist_info = proc.history.get(found_pid, {}).get('distance', 0)
+        proc.cmd_console.add_output(
+            f"✅ Found '{name}' ({found_pid}) at {dist_info:.2f}m!\n"
+            f"   Type 'go' to navigate or 'follow' to track:"
+        )
+        if proc.tts_enabled:
+            tts_speak(f"Found {name}")
+        # Wait for user response (go / follow / cancel)
+        proc._find_person_choice = found_pid
+    else:
+        proc.cmd_console.add_output(f"❌ '{name}' not found after 360° scan.")
+        if proc.tts_enabled:
+            tts_speak(f"{name} not found")
+
+# ==========================
 #  PROMPT THREAD (SELECCIÓN Y NAVEGACIÓN)
 # ==========================
 def prompt_thread(proc):
@@ -3205,6 +3286,49 @@ def prompt_thread(proc):
                 proc.pending_enrollment = None
                 proc.cmd_console.add_output("⚠️ Enrollment cancelled (new command).")
                 # Fall through to process the new command normally
+
+        # ─── Handle pending FIND PERSON name input ──────────────────
+        if getattr(proc, '_find_person_pending', False):
+            proc._find_person_pending = False
+            target_name = last_command.strip()
+            if proc.face_system:
+                known = proc.face_system.list_people()
+                # Case-insensitive match
+                actual_name = None
+                for kn in known:
+                    if kn.lower() == target_name.lower():
+                        actual_name = kn
+                        break
+                if actual_name:
+                    proc.cmd_console.add_output(f"🔎 Scanning for '{actual_name}'...")
+                    if proc.tts_enabled:
+                        tts_speak(f"Searching for {actual_name}")
+                    threading.Thread(
+                        target=_find_person_scan,
+                        args=(proc, actual_name),
+                        daemon=True,
+                    ).start()
+                else:
+                    proc.cmd_console.add_output(
+                        f"❌ '{target_name}' not in database. Known: {', '.join(known)}"
+                    )
+            continue
+
+        # ─── Handle pending FIND PERSON go/follow choice ────────────
+        if getattr(proc, '_find_person_choice', None) is not None:
+            choice = last_command.strip().lower()
+            pid = proc._find_person_choice
+            proc._find_person_choice = None
+
+            if choice in ('go', 'ir', 've', 'navigate'):
+                person_num = pid.split('_')[1]
+                proc.cmd_console.submit_command(f"go to person {person_num}")
+            elif choice in ('follow', 'sigue', 'seguir', 'track', 'f'):
+                person_num = pid.split('_')[1]
+                proc.cmd_console.submit_command(f"follow person {person_num}")
+            else:
+                proc.cmd_console.add_output("⚠️ Find cancelled. (Expected 'go' or 'follow')")
+            continue
 
         # ─── Check for ENHANCE / ADD-ANGLE intent (before enrollment) ─
         enhance_intent = detect_enhance_intent(last_command)
@@ -4140,6 +4264,20 @@ def display_thread(proc):
                 proc.gesture_active.clear()
                 if proc.tts_enabled:
                     tts_speak("Gesture mode deactivated")
+        elif key == getattr(Config.Keybinds, 'KEY_FIND_PERSON', ord('9')):
+            if not proc.face_system:
+                proc.cmd_console.add_output("❌ Face recognition not loaded. Press 4 first.")
+            elif proc.guided_mode:
+                proc.cmd_console.add_output("⚠️ Navigation already active. Cancel with 5 first.")
+            else:
+                # Prompt for name — submit it as a find command
+                known = proc.face_system.list_people()
+                if not known:
+                    proc.cmd_console.add_output("❌ No faces enrolled in database.")
+                else:
+                    proc.cmd_console.add_output(f"🔎 FIND PERSON — enrolled: {', '.join(known)}")
+                    proc.cmd_console.add_output("   Type the name and press Enter:")
+                    proc._find_person_pending = True
         elif key in Config.Keybinds.KEY_ARROW_PREFIX:
             key2 = cv2.waitKey(1) & 0xFF
             if key2 == Config.Keybinds.KEY_ARROW_UP:
@@ -4155,6 +4293,7 @@ def display_thread(proc):
                 Config.Keybinds.KEY_SAFE_MODE,               # 6
                 ord(Config.Keybinds.KEY_MANUAL_TOGGLE),      # 7
                 getattr(Config.Keybinds, 'KEY_GESTURE_MODE', ord('8')),  # 8
+                getattr(Config.Keybinds, 'KEY_FIND_PERSON', ord('9')),   # 9
             }
             if key not in hotkey_codes:
                 proc.cmd_console.add_to_input(chr(key))
@@ -4456,6 +4595,7 @@ if __name__ == '__main__':
     proc.cmd_console.add_output(f"   6 = Toggle Modo Seguro (velocidad mínima)")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
     proc.cmd_console.add_output(f"   8 = Toggle gesture recognition")
+    proc.cmd_console.add_output(f"   9 = Find person (360° scan)")
     proc.cmd_console.add_output(f"   TTS: {'ON' if proc.tts_enabled else 'OFF (pyttsx3 not installed)'}")
     proc.cmd_console.add_output("")
 

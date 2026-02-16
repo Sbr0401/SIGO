@@ -261,6 +261,21 @@ def _tts_worker():
         except Exception:
             pass  # Don't crash the TTS thread
 
+def _tts_shutdown():
+    """Cleanly stop the TTS engine to avoid pyttsx3 DriverProxy.__del__ error."""
+    global _tts_engine
+    if _tts_thread_started:
+        try:
+            _tts_queue.put_nowait(None)  # Poison pill to stop worker
+        except Full:
+            pass
+    if _tts_engine is not None:
+        try:
+            _tts_engine.stop()
+        except Exception:
+            pass
+        _tts_engine = None
+
 def tts_speak(text: str):
     """Enqueue text for TTS playback (non-blocking). Drops if queue full."""
     global _tts_thread_started
@@ -4503,6 +4518,9 @@ if __name__ == '__main__':
         close_port()
     except Exception as e:
         print(f"⚠️ Error cerrando puerto: {e}")
+
+    # Stop TTS engine cleanly (avoids pyttsx3 DriverProxy.__del__ error)
+    _tts_shutdown()
 
     # Esperar a que los hilos terminen (con timeout más corto)
     print("🧹 Limpiando recursos...")

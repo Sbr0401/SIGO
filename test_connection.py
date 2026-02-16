@@ -7,11 +7,19 @@ import socket
 import serial
 import time
 
-# Configuración (ajusta según tu config.py)
-SERIAL_PORT = 'COM8'
-SERIAL_BAUD = 9600
-WIFI_IP = '192.168.165.76'
-WIFI_PORT = 5555
+# Import from config.py so values stay in sync
+try:
+    from config import Config
+    SERIAL_PORT = Config.Hardware.SERIAL_PORT
+    SERIAL_BAUD = Config.Hardware.SERIAL_BAUD
+    WIFI_IP = Config.Hardware.WIFI_IP
+    WIFI_PORT = Config.Hardware.WIFI_PORT
+except Exception:
+    # Fallback if config import fails
+    SERIAL_PORT = 'COM8'
+    SERIAL_BAUD = 9600
+    WIFI_IP = '192.168.1.100'
+    WIFI_PORT = 5555
 
 def test_serial():
     """Prueba conexión serial"""

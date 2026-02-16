@@ -7,7 +7,7 @@
 #   RTX 20/30/40:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # Core dependencies
-opencv-python>=4.10.0,<5.0.0
+opencv-contrib-python>=4.10.0,<5.0.0
 ultralytics>=8.3.0,<9.0.0
 openai>=1.55.0,<2.0.0
 faster-whisper>=1.1.0
@@ -16,6 +16,7 @@ scipy>=1.14.0
 sounddevice>=0.5.1
 pyserial>=3.5
 keyboard>=0.13.5
+pyttsx3>=2.90
 pywin32>=308; sys_platform == 'win32'
 
 # Performance boosters

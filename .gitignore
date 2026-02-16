@@ -25,8 +25,7 @@ Desktop.ini
 # *.pt  — NOT ignored: yolov8s-pose.pt ships with the repo for offline use
 
 # Face database (user-specific enrolled faces — starts empty)
-face_database/*.pkl
-face_database/*.pkl.bak
+face_database/
 face_database_test/
 
 # Calibration data (camera-specific — ships with repo for reference)

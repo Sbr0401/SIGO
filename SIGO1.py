@@ -612,7 +612,9 @@ SMOOTH_WINDOW_SIZE = getattr(Config.Vision, 'SMOOTH_WINDOW_SIZE', 5)
 GAMMA_CORRECTION = getattr(Config.Vision, 'GAMMA_CORRECTION', 1.2)
 
 # Configuraciones por tipo de fuente — single canonical definition.
-if hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
+if hasattr(Config, 'Source') and hasattr(Config.Source, 'get_source_configs'):
+    SOURCE_CONFIGS = Config.Source.get_source_configs()
+elif hasattr(Config, 'Source') and hasattr(Config.Source, 'SOURCES'):
     SOURCE_CONFIGS = Config.Source.SOURCES
 else:
     SOURCE_CONFIGS = {
@@ -1460,6 +1462,7 @@ class VideoProcessor:
         self.gesture_cooldowns = {}       # person_id -> {gesture: last_trigger_time}
         self.gesture_active = {}          # person_id -> current gesture string or None
         self.gesture_nav_target = None    # person_id currently being navigated to via gesture
+        self.cancel_nav_event = threading.Event()  # set by gesture BOTH_HANDS_UP to cancel navigation
         
         # F4: TTS enabled flag (speaks navigation events)
         self.tts_enabled = TTS_AVAILABLE
@@ -1531,18 +1534,6 @@ class VideoProcessor:
         area = cv2.contourArea(pts)
         tol = 0.2 if area > 50000 else 0.4
         return (max(lengths)/min(lengths)) < (1 + tol)
-
-    def _init_aruco_detector(self):
-        """Initialise ArUco detector (called lazily only when ArUco mode is on)."""
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        params = cv2.aruco.DetectorParameters()
-        params.minMarkerPerimeterRate = 0.02
-        params.adaptiveThreshWinSizeMin = 3
-        params.adaptiveThreshWinSizeMax = 23
-        params.adaptiveThreshConstant = 7
-        params.polygonalApproxAccuracyRate = 0.05
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
 
     def _expand_roi(self, cx, cy, w, h, fh, fw):
         ew, eh = w*self.roi_scale, h*self.roi_scale
@@ -2057,6 +2048,7 @@ class VideoProcessor:
                     tts_speak(f"{name_label} signals stop")
                 if self.guided_mode:
                     self.gesture_nav_target = None
+                    self.cancel_nav_event.set()
                     self.cmd_console.submit_command(Config.Keybinds.KEY_CANCEL_NAV)
                 continue
 
@@ -3568,7 +3560,8 @@ def prompt_thread(proc):
         try:
             open_port()
             while not proc.stop_event.is_set():
-                if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV):
+                if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV) or proc.cancel_nav_event.is_set():
+                    proc.cancel_nav_event.clear()
                     proc.cmd_console.add_output(f"🛑 MODO NAVEGACIÓN CANCELADO (tecla {Config.Keybinds.KEY_CANCEL_NAV.upper()})")
                     if proc.tts_enabled:
                         tts_speak("Navigation cancelled")
@@ -4175,8 +4168,8 @@ def display_thread(proc):
 _MANUAL_CHANNEL_KEYS = [
     'MANUAL_ROTATE_CCW',   # channel 0: CCW
     'MANUAL_ROTATE_CW',    # channel 1: CW
-    'MANUAL_UP',           # channel 2: Up
-    'MANUAL_DOWN',         # channel 3: Down
+    'MANUAL_LEFT',         # channel 2: Left
+    'MANUAL_RIGHT',        # channel 3: Right
     'MANUAL_FORWARD',      # channel 4: Forward
     'MANUAL_BACK',         # channel 5: Backward
 ]

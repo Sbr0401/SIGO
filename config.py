@@ -104,7 +104,6 @@ class NavigationConfig:
 class VisionConfig:
     """Computer vision settings"""
     # ArUco marker
-    ARUCO_DICT = 'DICT_4X4_50'
     ARUCO_MARKER_SIZE = 0.20  # meters (20cm)
     
     # ArUco detector parameters
@@ -174,6 +173,22 @@ class SourceConfig:
         """Generate stream URL"""
         ip = camera_ip or HardwareConfig.CAMERA_IP
         return f"http://{ip}/stream"
+    
+    @classmethod
+    def get_source_configs(cls,  camera_ip=None):
+        """Return SOURCES dict with dynamic 'url' injected into stream entry."""
+        configs = dict(cls.SOURCES)
+        # Inject the stream URL (computed from current CAMERA_IP)
+        stream = dict(configs.get("stream", {}))
+        stream["url"] = cls.get_stream_url(camera_ip)
+        configs["stream"] = stream
+        return configs
+    
+    @classmethod
+    def get_stream_url(cls, camera_ip=None):
+        """Generate stream URL"""
+        ip = camera_ip or HardwareConfig.CAMERA_IP
+        return f"http://{ip}/stream"
 
 # ==========================
 #  UI CONFIGURATION
@@ -235,8 +250,8 @@ class KeybindConfig:
     # Manual control mapping (key: bit position)
     MANUAL_ROTATE_CCW = 'j'  # Rotate counter-clockwise - Bit 0
     MANUAL_ROTATE_CW = 'l'   # Rotate clockwise - Bit 1
-    MANUAL_UP = 'i'          # Move up - Bit 2
-    MANUAL_DOWN = 'k'        # Move down - Bit 3
+    MANUAL_LEFT = 'i'        # Move left - Bit 2
+    MANUAL_RIGHT = 'k'       # Move right - Bit 3
     MANUAL_FORWARD = 'u'     # Move forward - Bit 4
     MANUAL_BACK = 'o'        # Move back/takeoff - Bit 5
     MANUAL_RESERVED = 'p'    # Reserved - Bit 6
@@ -249,8 +264,8 @@ class KeybindConfig:
         return {
             KeybindConfig.MANUAL_ROTATE_CCW: 1 << 0,
             KeybindConfig.MANUAL_ROTATE_CW: 1 << 1,
-            KeybindConfig.MANUAL_UP: 1 << 2,
-            KeybindConfig.MANUAL_DOWN: 1 << 3,
+            KeybindConfig.MANUAL_LEFT: 1 << 2,
+            KeybindConfig.MANUAL_RIGHT: 1 << 3,
             KeybindConfig.MANUAL_FORWARD: 1 << 4,
             KeybindConfig.MANUAL_BACK: 1 << 5,
             KeybindConfig.MANUAL_RESERVED: 1 << 6,

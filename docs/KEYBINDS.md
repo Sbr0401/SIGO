@@ -46,8 +46,8 @@ Todos los keybinds se pueden modificar en **`config.py`** → Clase **`KeybindCo
 |-------|---------|-----|------------------|
 | **J** | Rotar anti-horario (CCW) | 0 | `MANUAL_ROTATE_CCW = 'j'` |
 | **L** | Rotar horario (CW) | 1 | `MANUAL_ROTATE_CW = 'l'` |
-| **I** | Izquierda | 2 | `MANUAL_UP = 'i'` |
-| **K** | Derecha | 3 | `MANUAL_DOWN = 'k'` |
+| **I** | Izquierda | 2 | `MANUAL_LEFT = 'i'` |
+| **K** | Derecha | 3 | `MANUAL_RIGHT = 'k'` |
 | **U** | Avanzar | 4 | `MANUAL_FORWARD = 'u'` |
 | **O** | Retroceder | 5 | `MANUAL_BACK = 'o'` |
 | **P** | Reservado | 6 | `MANUAL_RESERVED = 'p'` |
@@ -72,8 +72,8 @@ class KeybindConfig:
     # Cambiar controles manuales (ejemplo: WASD style)
     MANUAL_ROTATE_CCW = 'a'  # En lugar de 'j'
     MANUAL_ROTATE_CW = 'd'   # En lugar de 'l'
-    MANUAL_UP = 'w'          # Izquierda, en lugar de 'i'
-    MANUAL_DOWN = 's'        # Derecha, en lugar de 'k'
+    MANUAL_LEFT = 'w'         # Izquierda, en lugar de 'i'
+    MANUAL_RIGHT = 's'        # Derecha, en lugar de 'k'
     MANUAL_FORWARD = 'e'     # En lugar de 'u'
     MANUAL_BACK = 'q'        # En lugar de 'o'
     
@@ -109,8 +109,8 @@ class KeybindConfig:
     MANUAL_BACK = 's'
     MANUAL_ROTATE_CCW = 'a'
     MANUAL_ROTATE_CW = 'd'
-    MANUAL_UP = 'e'
-    MANUAL_DOWN = 'q'
+    MANUAL_LEFT = 'e'
+    MANUAL_RIGHT = 'q'
     MANUAL_FAST = 'shift'  # Requiere modificación adicional
 ```
 
@@ -125,8 +125,8 @@ class KeybindConfig:
     MANUAL_BACK = 'down'
     MANUAL_ROTATE_CCW = 'left'
     MANUAL_ROTATE_CW = 'right'
-    MANUAL_UP = 'pageup'
-    MANUAL_DOWN = 'pagedown'
+    MANUAL_LEFT = 'pageup'
+    MANUAL_RIGHT = 'pagedown'
 ```
 
 ### Setup 3: Una Mano (Numpad)
@@ -139,8 +139,8 @@ class KeybindConfig:
     MANUAL_BACK = '2'
     MANUAL_ROTATE_CCW = '4'
     MANUAL_ROTATE_CW = '6'
-    MANUAL_UP = '9'
-    MANUAL_DOWN = '3'
+    MANUAL_LEFT = '9'
+    MANUAL_RIGHT = '3'
     MANUAL_FAST = '5'
 ```
 

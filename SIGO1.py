@@ -4202,6 +4202,35 @@ def display_thread(proc):
             proc.stop_event.set()
             break  # Salir inmediatamente del loop
 
+        # ── EMERGENCY STOP (key 5) — halts ALL movement regardless of state ──
+        if key == ord(Config.Keybinds.KEY_CANCEL_NAV):
+            proc.cancel_nav_event.set()          # breaks navigation loop
+            proc.gesture_nav_target = None       # clear gesture nav
+            proc._find_person_pending = False    # cancel find-person prompt
+            proc._find_person_choice = None      # cancel find-person choice
+            with proc.manual_mode_lock:
+                was_manual = proc.manual_mode
+                proc.manual_mode = False         # exits manual_control_loop
+            # Send stop bytes directly (best-effort, port may not be open)
+            try:
+                if control and (getattr(control, '_ser', None) and control._ser.is_open
+                                or getattr(control, '_sock', None)):
+                    control.send(0, 0)
+            except Exception:
+                pass
+            mode_label = []
+            if was_manual:
+                mode_label.append("manual")
+            if proc.guided_mode:
+                mode_label.append("navigation")
+            proc.cmd_console.add_output(
+                f"🛑 EMERGENCY STOP — all movement halted"
+                + (f" ({', '.join(mode_label)} cancelled)" if mode_label else "")
+            )
+            if proc.tts_enabled:
+                tts_speak("Emergency stop")
+            continue
+
         with proc.manual_mode_lock:
             if proc.manual_mode:
                 continue
@@ -4591,7 +4620,7 @@ if __name__ == '__main__':
     proc.cmd_console.add_output(f"   TAB = Salir del programa")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_VOICE_RECORD} = Grabar comando de voz")
     proc.cmd_console.add_output(f"   {chr(Config.Keybinds.KEY_FACE_RECOGNITION)} = Reconocimiento facial")
-    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = Cancelar navegación")
+    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = EMERGENCY STOP (halts all movement)")
     proc.cmd_console.add_output(f"   6 = Toggle Modo Seguro (velocidad mínima)")
     proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
     proc.cmd_console.add_output(f"   8 = Toggle gesture recognition")

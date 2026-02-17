@@ -203,12 +203,27 @@ class FaceDatabase:
             print(f"[FaceDB] Save error: {e}")
 
     # ── add / remove / query ───────────────────────────────────────────
+    MAX_EMBEDDINGS_PER_PERSON = 15  # Cap to prevent unbounded growth
+
     def add_face(self, name: str, embedding: np.ndarray,
                  face_image: np.ndarray = None) -> bool:
         with self.lock:
             if name not in self.people:
                 self.people[name] = {'embeddings': [], 'enrolled_at': time.time()}
-            self.people[name]['embeddings'].append(embedding)
+
+            embs = self.people[name]['embeddings']
+
+            # Dedup: skip if very similar to an existing embedding (cosine > 0.92)
+            if embs:
+                sims = np.dot(np.array(embs), embedding)
+                if float(sims.max()) > 0.92:
+                    return False  # Already have a near-identical embedding
+
+            # Cap: if at max, replace the oldest (FIFO)
+            if len(embs) >= self.MAX_EMBEDDINGS_PER_PERSON:
+                embs.pop(0)
+
+            embs.append(embedding)
 
             if face_image is not None:
                 img_dir = self.database_dir / name
@@ -495,7 +510,21 @@ class LiveFaceRecognition:
 
                 embedding = self.arcface.get_embedding(aligned)
                 with self.database.lock:
-                    self.database.people[name]['embeddings'].append(embedding)
+                    embs = self.database.people[name]['embeddings']
+                    # Dedup: skip near-identical embeddings
+                    if embs:
+                        sims = np.dot(np.array(embs), embedding)
+                        if float(sims.max()) > 0.92:
+                            print(f"[FaceDB] Skipped {img_path.name} (too similar to existing)")
+                            try:
+                                img_path.unlink()
+                            except Exception:
+                                pass
+                            continue
+                    # Cap at max
+                    if len(embs) >= FaceDatabase.MAX_EMBEDDINGS_PER_PERSON:
+                        embs.pop(0)
+                    embs.append(embedding)
                 added += 1
                 print(f"[FaceDB] Enrolled from {img_path.name} → '{name}'")
 

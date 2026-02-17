@@ -6,6 +6,9 @@ setlocal EnableDelayedExpansion
 :: SIGO - Script de Instalacion Automatica
 :: ============================================
 
+:: Ensure working directory is where the bat lives (SIGO-FINAL)
+cd /d "%~dp0"
+
 color 0A
 title SIGO - Instalacion y Configuracion
 
@@ -34,6 +37,7 @@ echo   [8] Configurar OpenAI API Key
 echo   [9] Conectar Scrcpy Wireless (DJI Spark)
 echo   [S] Scrcpy + SIGO (conectar y ejecutar todo)
 echo   [R] Ejecutar SIGO
+echo   [E] Enroll Face (agregar fotos para reconocimiento)
 echo   [0] Salir
 echo.
 echo  --------------------------------------------------------------
@@ -50,6 +54,7 @@ if "%choice%"=="8" goto OPENAI_KEY
 if "%choice%"=="9" goto SCRCPY_ONLY
 if /i "%choice%"=="S" goto SCRCPY_THEN_SIGO
 if /i "%choice%"=="R" goto RUN_SIGO
+if /i "%choice%"=="E" goto ENROLL_FACE
 if "%choice%"=="0" goto END
 goto MENU
 
@@ -730,6 +735,108 @@ echo  -----------------------------------------------------------
 pause >nul
 
 exit /b 0
+
+:: ============================================
+:: ENROLL FACE - Add photos for recognition
+:: ============================================
+:ENROLL_FACE
+cls
+echo.
+echo  ==============================================================
+echo         Enroll Face - Agregar fotos para reconocimiento
+echo  ==============================================================
+echo.
+echo  Las fotos seran procesadas al iniciar SIGO y luego eliminadas
+echo  para evitar sobre-entrenamiento.
+echo.
+echo  Tip: Usa 3-5 fotos con diferentes angulos para mejor resultado.
+echo.
+
+set /p "FACE_NAME=  Nombre de la persona: "
+
+if "!FACE_NAME!"=="" (
+    echo.
+    echo  [ERROR] Nombre vacio. Operacion cancelada.
+    echo.
+    pause
+    goto MENU
+)
+
+REM Sanitize: remove quotes
+set "FACE_NAME=!FACE_NAME:"=!"
+
+REM Trim leading/trailing spaces from name
+for /f "tokens=* delims= " %%a in ("!FACE_NAME!") do set "FACE_NAME=%%a"
+
+REM Determine face_database path (one level above SIGO-FINAL)
+set "FACE_DB_DIR=%~dp0..\face_database"
+set "PERSON_DIR=!FACE_DB_DIR!\!FACE_NAME!"
+
+REM Create person directory
+if not exist "!PERSON_DIR!" (
+    mkdir "!PERSON_DIR!"
+    echo  [OK] Carpeta creada: !FACE_NAME!
+) else (
+    echo  [INFO] Carpeta ya existe: !FACE_NAME!
+)
+
+echo.
+echo  Abriendo selector de archivos...
+echo  (Selecciona una o mas imagenes JPG/PNG)
+echo.
+
+REM Use PowerShell to open a multi-file dialog
+set "PS_SCRIPT=Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Seleccionar fotos para: !FACE_NAME!'; $d.Filter = 'Imagenes (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp|Todos (*.*)|*.*'; $d.Multiselect = $true; $d.InitialDirectory = [Environment]::GetFolderPath('MyPictures'); if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join '|' } else { 'CANCELLED' }"
+
+set "SELECTED_FILES="
+for /f "delims=" %%f in ('powershell -NoProfile -Command "!PS_SCRIPT!"') do (
+    set "SELECTED_FILES=%%f"
+)
+
+if "!SELECTED_FILES!"=="CANCELLED" (
+    echo  [INFO] Seleccion cancelada por el usuario.
+    echo.
+    pause
+    goto MENU
+)
+
+if "!SELECTED_FILES!"=="" (
+    echo  [ERROR] No se seleccionaron archivos.
+    echo.
+    pause
+    goto MENU
+)
+
+REM Copy each selected file to the person's folder
+set "COPY_COUNT=0"
+for %%f in ("!SELECTED_FILES:|=" "!") do (
+    if exist "%%~f" (
+        copy /y "%%~f" "!PERSON_DIR!\" >nul 2>&1
+        if not errorlevel 1 (
+            set /a COPY_COUNT+=1
+            echo  [OK] Copiado: %%~nxf
+        ) else (
+            echo  [ERROR] No se pudo copiar: %%~nxf
+        )
+    )
+)
+
+echo.
+if !COPY_COUNT! GTR 0 (
+    echo  ==============================================================
+    echo   !COPY_COUNT! foto^(s^) agregadas para: !FACE_NAME!
+    echo  ==============================================================
+    echo.
+    echo  Las fotos seran procesadas automaticamente al iniciar SIGO.
+    echo  Despues del enrollment, las fotos se eliminan para evitar
+    echo  duplicados y sobre-entrenamiento.
+    echo.
+) else (
+    echo  [WARN] No se copiaron fotos. Verifica los archivos.
+    echo.
+)
+pause
+goto MENU
 
 :: ============================================
 :: SALIR

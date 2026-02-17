@@ -48,6 +48,16 @@ except Exception:
 import serial
 import serial.tools.list_ports
 
+# Directory where this script lives (for resolving model paths)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Early GPU detection (done once at import time)
+_HAS_CUDA = torch.cuda.is_available()
+if _HAS_CUDA:
+    print(f"✅ GPU detectada: {torch.cuda.get_device_name(0)}")
+else:
+    print("ℹ️  No NVIDIA GPU — usando CPU para inferencia")
+
 # Text-to-Speech for audio feedback (F4)
 try:
     import pyttsx3
@@ -152,7 +162,7 @@ except ImportError:
 #  CONFIG WHISPER / AUDIO
 # ==========================
 WHISPER_MODEL = None  # Lazy load
-WHISPER_USE_CUDA = torch.cuda.is_available()
+WHISPER_USE_CUDA = _HAS_CUDA
 WHISPER_SAMPLE_RATE = getattr(Config.AI, 'WHISPER_SAMPLE_RATE', 16000)
 
 def get_whisper_model():
@@ -1731,15 +1741,15 @@ class VideoProcessor:
         # Lazy load YOLO on first detection
         if self.yolo is None:
             print("🔍 Cargando modelo YOLO (primera vez)...")
-            model_path = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            model_name = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            model_path = os.path.join(_SCRIPT_DIR, model_name) if not os.path.isabs(model_name) else model_name
             self.yolo = YOLO(model_path)
             self.object_classes = self.yolo.names
             print("✅ Modelo YOLO listo (YOLOv11 con ByteTrack)")
         
         DET_RAD = DETECTION_RADIUS_SCALE
         # Use YOLO tracking with ByteTrack (built-in, more reliable than MOSSE)
-        # Use same device as pose model (respects GPU/CPU config)
-        yolo_device = 0 if getattr(self, 'pose_device', None) == 'cuda' else 'cpu'
+        yolo_device = 0 if self.pose_device == 'cuda' else 'cpu'
         try:
             results = self.yolo.track(frame, conf=YOLO_CONF, verbose=False, device=yolo_device, persist=True, classes=[0])
         except Exception:
@@ -1782,33 +1792,34 @@ class VideoProcessor:
         # Lazy load pose model
         if self.pose_model is None:
             print("🧍 Cargando modelo de pose (primera vez)...")
+            pose_name = getattr(getattr(Config, 'AI', None), 'POSE_MODEL', 'yolov8s-pose.pt')
+            pose_path = os.path.join(_SCRIPT_DIR, pose_name) if not os.path.isabs(pose_name) else pose_name
             try:
-                self.pose_model = YOLO('yolov8s-pose.pt')
-                self.pose_model.to('cuda')
-                self.pose_device = 'cuda'
-                print("✅ Modelo de pose listo - MODO PRINCIPAL (GPU: ON, ByteTrack tracking)")
-            except Exception as e:
-                print(f"\n⚠️ GPU loading failed: {e}")
-                
-                if "Torch not compiled with CUDA enabled" in str(e):
-                    print("\n🛑 DIAGNÓSTICO: Tu PyTorch no tiene soporte GPU instalada.")
-                    print("   Ejecuta: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall")
-                    
-                import torch
-                print(f"   Debug Info:")
-                print(f"   - Torch Version: {torch.__version__}")
-                print(f"   - CUDA Available: {torch.cuda.is_available()}")
-                if torch.cuda.is_available():
-                     print(f"   - GPU Device: {torch.cuda.get_device_name(0)}")
-                
-                print("\n⚠️  Cambiando a modo CPU (Lento)...")
-                try:
-                    self.pose_model = YOLO('yolov8s-pose.pt')
+                self.pose_model = YOLO(pose_path)
+                if _HAS_CUDA:
+                    self.pose_model.to('cuda')
+                    self.pose_device = 'cuda'
+                    print("✅ Modelo de pose listo - MODO PRINCIPAL (GPU: ON, ByteTrack tracking)")
+                else:
                     self.pose_model.to('cpu')
                     self.pose_device = 'cpu'
                     print("✅ Modelo de pose listo (CPU mode, ByteTrack tracking)")
-                except Exception as e2:
-                    print(f"❌ Falló también en CPU: {e2}")
+            except Exception as e:
+                print(f"\n⚠️ Pose model loading failed: {e}")
+                print(f"   Torch: {torch.__version__}, CUDA: {_HAS_CUDA}")
+                if _HAS_CUDA:
+                    print("⚠️  GPU falló, cambiando a CPU...")
+                    try:
+                        self.pose_model = YOLO(pose_path)
+                        self.pose_model.to('cpu')
+                        self.pose_device = 'cpu'
+                        print("✅ Modelo de pose listo (CPU fallback)")
+                    except Exception as e2:
+                        print(f"❌ Falló también en CPU: {e2}")
+                        self.use_pose_distance = False
+                        return
+                else:
+                    print(f"❌ No se pudo cargar el modelo de pose: {e}")
                     self.use_pose_distance = False
                     return
         
@@ -2086,7 +2097,8 @@ class VideoProcessor:
         """F6: Run YOLO obstacle detection for non-person objects."""
         if self.yolo is None:
             # Lazy load YOLO model
-            model_path = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            model_name = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
+            model_path = os.path.join(_SCRIPT_DIR, model_name) if not os.path.isabs(model_name) else model_name
             try:
                 self.yolo = YOLO(model_path)
                 self.object_classes = self.yolo.names
@@ -2094,7 +2106,7 @@ class VideoProcessor:
                 print(f"[F6] YOLO load failed: {e}")
                 return
         
-        yolo_device = 0 if getattr(self, 'pose_device', None) == 'cuda' else 'cpu'
+        yolo_device = 0 if self.pose_device == 'cuda' else 'cpu'
         try:
             results = self.yolo(frame, conf=OBSTACLE_CONFIDENCE, verbose=False,
                                 device=yolo_device, classes=OBSTACLE_CLASSES)

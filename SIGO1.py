@@ -325,16 +325,22 @@ def detect_arduino_port():
         pass
     return None
 
-def encode_arduino_pair(ccw=0, cw=0, up=0, down=0, fwd=0, bwd=0):
-    """Encode 6 channels with magnitude levels (0-3) into 2-byte Arduino protocol.
+def encode_arduino_pair(ccw=0, cw=0, up=0, down=0, fwd=0, bwd=0, left=0, right=0):
+    """Encode 8 channels with magnitude levels (0-3) into 2-byte Arduino protocol.
+
+    Bit layout (same bit position across b1 and b2):
+      0: CCW rotation    1: CW rotation
+      2: Up              3: Down
+      4: Forward          5: Backward
+      6: Strafe left     7: Strafe right
 
     Each channel N is encoded across b1[N] and b2[N]:
-      mag 0  → b1=0 b2=0  → Arduino getMag returns  0  (off)
-      mag 1  → b1=1 b2=0  → Arduino getMag returns 10  (light)
-      mag 2  → b1=0 b2=1  → Arduino getMag returns 20  (medium)
-      mag 3  → b1=1 b2=1  → Arduino getMag returns 30  (strong)
+      mag 0  → b1=0 b2=0  (off)
+      mag 1  → b1=1 b2=0  (gentle)
+      mag 2  → b1=0 b2=1  (medium)
+      mag 3  → b1=1 b2=1  (strong)
     """
-    channels = [ccw, cw, up, down, fwd, bwd]
+    channels = [ccw, cw, up, down, fwd, bwd, left, right]
     b1 = 0
     b2 = 0
     for i, mag in enumerate(channels):
@@ -2829,6 +2835,8 @@ def _compute_nav_magnitudes(d: dict, target: float, safe_mode: bool = False):
         'down': down_mag,
         'fwd': fwd_mag,
         'bwd': bwd_mag,
+        'left': 0,
+        'right': 0,
     }
 
 def send_commands_byte(d: dict, target: float):
@@ -2836,7 +2844,8 @@ def send_commands_byte(d: dict, target: float):
     mags = _compute_nav_magnitudes(d, target, safe_mode=get_nav_safe_mode())
     b1, b2 = encode_arduino_pair(
         ccw=mags['ccw'], cw=mags['cw'], up=mags['up'],
-        down=mags['down'], fwd=mags['fwd'], bwd=mags['bwd']
+        down=mags['down'], fwd=mags['fwd'], bwd=mags['bwd'],
+        left=mags['left'], right=mags['right']
     )
     control.send(b1, b2)
 
@@ -2855,6 +2864,8 @@ def print_navigation_commands(d: dict, target: float, follow: bool = False):
     up_m = mags['up']
     dn_m = mags['down']
     fwd = mags['fwd']
+    lft = mags['left']
+    rgt = mags['right']
 
     gap_str = f"{dist - target:.2f}m restantes" if fwd > 0 else "EN POSICION"
     mode_str = "MODO SEGURO: ON" if get_nav_safe_mode() else "MODO SEGURO: OFF"
@@ -2868,9 +2879,10 @@ def print_navigation_commands(d: dict, target: float, follow: bool = False):
         f"Dir:  X:{ax:+.1f} Y:{ay:+.1f}",
         "",
         "SERVOS:",
-        f"  ROT  CCW:{_MAG_LABELS[ccw]}  CW:{_MAG_LABELS[cw]}",
-        f"  TILT UP:{_MAG_LABELS[up_m]}  DN:{_MAG_LABELS[dn_m]}",
-        f"  FWD  {_MAG_LABELS[fwd]}",
+        f"  ROT   CCW:{_MAG_LABELS[ccw]}  CW:{_MAG_LABELS[cw]}",
+        f"  TILT  UP:{_MAG_LABELS[up_m]}  DN:{_MAG_LABELS[dn_m]}",
+        f"  FWD   {_MAG_LABELS[fwd]}",
+        f"  STRAFE L:{_MAG_LABELS[lft]}  R:{_MAG_LABELS[rgt]}",
         f"  -> {gap_str}",
         f"  {mode_str}",
         "===============================",
@@ -4334,12 +4346,14 @@ def display_thread(proc):
 # ==========================
 # Keys that map to each Arduino channel (order matches Arduino bit layout)
 _MANUAL_CHANNEL_KEYS = [
-    'MANUAL_ROTATE_CCW',   # channel 0: CCW
-    'MANUAL_ROTATE_CW',    # channel 1: CW
-    'MANUAL_LEFT',         # channel 2: Left
-    'MANUAL_RIGHT',        # channel 3: Right
+    'MANUAL_ROTATE_CCW',   # channel 0: CCW rotation
+    'MANUAL_ROTATE_CW',    # channel 1: CW rotation
+    'MANUAL_UP',           # channel 2: Up
+    'MANUAL_DOWN',         # channel 3: Down
     'MANUAL_FORWARD',      # channel 4: Forward
     'MANUAL_BACK',         # channel 5: Backward
+    'MANUAL_LEFT',         # channel 6: Strafe left
+    'MANUAL_RIGHT',        # channel 7: Strafe right
 ]
 
 def manual_control_loop(proc: VideoProcessor):
@@ -4389,11 +4403,13 @@ def manual_control_loop(proc: VideoProcessor):
 
                 b1, b2 = encode_arduino_pair(
                     ccw=mags[0], cw=mags[1], up=mags[2],
-                    down=mags[3], fwd=mags[4], bwd=mags[5]
+                    down=mags[3], fwd=mags[4], bwd=mags[5],
+                    left=mags[6] if len(mags) > 6 else 0,
+                    right=mags[7] if len(mags) > 7 else 0
                 )
                 control.send(b1, b2)
                 active = [_MANUAL_CHANNEL_KEYS[i].split('_',1)[1]
-                          for i in range(6) if mags[i] > 0]
+                          for i in range(len(mags)) if mags[i] > 0]
                 label = ', '.join(active) if active else 'STOP'
                 speed = 'FAST' if is_fast and active else ''
                 proc.console.add_output(f"[MANUAL] {label} {speed}  b1={b1:06b} b2={b2:06b}")

@@ -251,12 +251,13 @@ class KeybindConfig:
     # Manual control mapping (key: bit position)
     MANUAL_ROTATE_CCW = 'j'  # Rotate counter-clockwise - Bit 0
     MANUAL_ROTATE_CW = 'l'   # Rotate clockwise - Bit 1
-    MANUAL_LEFT = 'i'        # Move left - Bit 2
-    MANUAL_RIGHT = 'k'       # Move right - Bit 3
+    MANUAL_UP = 'i'          # Tilt up - Bit 2
+    MANUAL_DOWN = 'k'        # Tilt down - Bit 3
     MANUAL_FORWARD = 'u'     # Move forward - Bit 4
-    MANUAL_BACK = 'o'        # Move back/takeoff - Bit 5
-    MANUAL_RESERVED = 'p'    # Reserved - Bit 6
-    MANUAL_FAST = 'f'        # Fast speed modifier - Bit 7
+    MANUAL_BACK = 'o'        # Move back - Bit 5
+    MANUAL_LEFT = 'n'        # Strafe left - Bit 6
+    MANUAL_RIGHT = 'm'       # Strafe right - Bit 7
+    MANUAL_FAST = 'f'        # Fast speed modifier
     
     # Manual control bit mapping (auto-generated from above)
     @staticmethod
@@ -265,12 +266,12 @@ class KeybindConfig:
         return {
             KeybindConfig.MANUAL_ROTATE_CCW: 1 << 0,
             KeybindConfig.MANUAL_ROTATE_CW: 1 << 1,
-            KeybindConfig.MANUAL_LEFT: 1 << 2,
-            KeybindConfig.MANUAL_RIGHT: 1 << 3,
+            KeybindConfig.MANUAL_UP: 1 << 2,
+            KeybindConfig.MANUAL_DOWN: 1 << 3,
             KeybindConfig.MANUAL_FORWARD: 1 << 4,
             KeybindConfig.MANUAL_BACK: 1 << 5,
-            KeybindConfig.MANUAL_RESERVED: 1 << 6,
-            KeybindConfig.MANUAL_FAST: 1 << 7
+            KeybindConfig.MANUAL_LEFT: 1 << 6,
+            KeybindConfig.MANUAL_RIGHT: 1 << 7,
         }
 
 # ==========================

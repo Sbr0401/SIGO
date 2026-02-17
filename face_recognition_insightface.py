@@ -216,9 +216,6 @@ class FaceDatabase:
                 ts = int(time.time() * 1000)
                 fname = f"enrolled_{ts}.jpg"
                 cv2.imwrite(str(img_dir / fname), face_image)
-                # Track filename so auto_enroll_from_photos() won't re-enroll it
-                files_list = self.people[name].setdefault('_enrolled_files', [])
-                files_list.append(fname)
 
             self._save()
             return True
@@ -443,17 +440,16 @@ class LiveFaceRecognition:
 
     # ── auto-enrollment from photos ────────────────────────────────────
     def auto_enroll_from_photos(self) -> int:
-        """Batch-enroll faces from existing images in face_database/{Name}/.
+        """Batch-enroll faces from images in face_database/{Name}/.
 
-        Scans each subdirectory of the database dir for .jpg/.png files.
-        For each image, detects a face (using eye/nose keypoints via MediaPipe
-        or simple frontal-face crop), computes ArcFace embedding, and adds it
-        to the database — but only if not already enrolled from that file.
+        Scans each subdirectory for image files, extracts a face from each,
+        computes the ArcFace embedding, adds it to the database, then
+        **deletes the source image** so it is never re-processed on the
+        next boot.  Images saved by live enrollment (enrolled_*.jpg) are
+        skipped — they are already in the database.
 
         Returns the number of NEW embeddings added.
         """
-        import glob
-
         db_dir = self.database.database_dir
         added = 0
 
@@ -462,47 +458,52 @@ class LiveFaceRecognition:
                 continue
             name = person_dir.name
 
-            # Collect image files
+            # Collect image files (skip enrolled_* which are live-enrollment snapshots)
             image_files = []
             for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp'):
-                image_files.extend(person_dir.glob(ext))
+                for p in person_dir.glob(ext):
+                    if not p.name.startswith('enrolled_'):
+                        image_files.append(p)
             if not image_files:
                 continue
 
-            # Track already-enrolled filenames to avoid duplicates
-            enrolled_key = f'_enrolled_files'
             with self.database.lock:
                 if name not in self.database.people:
                     self.database.people[name] = {
                         'embeddings': [], 'enrolled_at': time.time()
                     }
-                enrolled_set = set(
-                    self.database.people[name].get(enrolled_key, [])
-                )
 
             for img_path in sorted(image_files):
-                fname = img_path.name
-                if fname in enrolled_set:
-                    continue  # already enrolled from this file
-
                 img = cv2.imread(str(img_path))
                 if img is None:
+                    print(f"[FaceDB] Cannot read {img_path.name}, deleting")
+                    try:
+                        img_path.unlink()
+                    except Exception:
+                        pass
                     continue
 
                 # Try to extract & align face from the photo
                 aligned = self._extract_face_from_photo(img)
                 if aligned is None:
-                    print(f"[FaceDB] No face detected in {img_path.name}, skipping")
+                    print(f"[FaceDB] No face detected in {img_path.name}, deleting")
+                    try:
+                        img_path.unlink()
+                    except Exception:
+                        pass
                     continue
 
                 embedding = self.arcface.get_embedding(aligned)
                 with self.database.lock:
                     self.database.people[name]['embeddings'].append(embedding)
-                    files_list = self.database.people[name].setdefault(
-                        enrolled_key, []
-                    )
-                    files_list.append(fname)
                 added += 1
+                print(f"[FaceDB] Enrolled from {img_path.name} → '{name}'")
+
+                # Delete source image so it's never re-processed
+                try:
+                    img_path.unlink()
+                except Exception as e:
+                    print(f"[FaceDB] Warning: could not delete {img_path.name}: {e}")
 
         if added > 0:
             self.database._save()

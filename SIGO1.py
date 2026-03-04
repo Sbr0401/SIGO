@@ -2652,6 +2652,7 @@ Return JSON:"""
                 print(f"[LLM DEBUG] Response is None/empty -> returning None")
                 return None
             
+            answer = _normalize_word_numbers(answer)
             answer_lower = answer.lower().replace(' ', '_')
             
             # Check for follow mode in text
@@ -2968,6 +2969,34 @@ def voice_input_thread(proc: VideoProcessor):
         time.sleep(0.5)
 
 # ==========================
+#  WORD-TO-NUMBER CONVERSION
+# ==========================
+_WORD_TO_NUM = {
+    # English
+    'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+    'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+    'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13',
+    'fourteen': '14', 'fifteen': '15', 'sixteen': '16', 'seventeen': '17',
+    'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+    # Spanish
+    'cero': '0', 'uno': '1', 'una': '1', 'dos': '2', 'tres': '3',
+    'cuatro': '4', 'cinco': '5', 'seis': '6', 'siete': '7', 'ocho': '8',
+    'nueve': '9', 'diez': '10', 'once': '11', 'doce': '12', 'trece': '13',
+    'catorce': '14', 'quince': '15',
+}
+
+_WORD_NUM_RE = re.compile(
+    r'\b(' + '|'.join(sorted(_WORD_TO_NUM.keys(), key=len, reverse=True)) + r')\b',
+    re.IGNORECASE
+)
+
+def _normalize_word_numbers(text: str) -> str:
+    """Replace written-out numbers (English/Spanish) with their digit equivalents.
+    E.g. 'save person five as Yoyo' -> 'save person 5 as Yoyo'
+    """
+    return _WORD_NUM_RE.sub(lambda m: _WORD_TO_NUM[m.group(1).lower()], text)
+
+# ==========================
 #  ENROLLMENT COMMAND PARSING
 # ==========================
 # Matches: "save person 1 as Yoyo", "add person_2 as Maria", "guardar persona 3 como Juan"
@@ -3032,7 +3061,7 @@ def detect_enrollment_intent(command: str):
       None if not enrollment intent
       dict with keys: {'person_num': str|None, 'target_name': str|None, 'reason': str}
     """
-    cmd = command.strip()
+    cmd = _normalize_word_numbers(command.strip())
     if not cmd:
         return None
 
@@ -3119,7 +3148,7 @@ def detect_enhance_intent(command: str):
       None if not enhance intent
       dict with keys: {'target_name': str|None, 'person_num': str|None, 'reason': str}
     """
-    cmd = command.strip()
+    cmd = _normalize_word_numbers(command.strip())
     if not cmd:
         return None
 

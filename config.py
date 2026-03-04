@@ -82,7 +82,7 @@ class AIConfig:
 class NavigationConfig:
     """Navigation and control settings"""
     # Target distances and thresholds
-    DISTANCE_TARGET = 1.5  # meters - target approach distance (safety minimum)
+    DISTANCE_TARGET = 3.5  # meters - target approach distance (safety minimum)
     DISTANCE_CORRECTION = 1.0  # distance measurement correction factor
     ROTATION_THRESHOLD = 5  # degrees before rotating
     FAST_SPEED_THRESHOLD = 1.0  # meters - use fast speed beyond this

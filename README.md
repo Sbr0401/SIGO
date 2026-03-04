@@ -1,47 +1,46 @@
-# SIGO - Sistema Inteligente de Guiado y Orientación
+# SIGO — Sistema Inteligente de Guiado y Orientación
 
-**Sistema de Navegación Completo con IA**
+> Sistema de navegación autónoma con IA para plataformas robóticas.
+> Detección de personas (YOLOv8-Pose), reconocimiento facial (ArcFace),
+> comandos de voz (Whisper) y control adaptativo vía Arduino.
 
-Este es el directorio consolidado de SIGO con todos los archivos necesarios.
-
-## 📁 Estructura de Directorios
+## 📁 Estructura del Proyecto
 
 ```
 SIGO-FINAL/
-├── SIGO1.py                         # Aplicación principal
-├── config.py                        # Configuración centralizada del sistema
-├── face_recognition_insightface.py  # Motor de reconocimiento facial (ArcFace ONNX)
-├── yolov8s-pose.pt                  # Modelo YOLOv8 de detección de poses
-├── yolo11n.pt                       # Modelo YOLOv11 de detección de objetos
+├── SIGO1.py                         # Aplicación principal (~4 700 líneas)
+├── config.py                        # Configuración centralizada
+├── face_recognition_insightface.py  # Reconocimiento facial (ArcFace / ONNX)
+├── calibrate_distance.py            # Calibración de distancia por pose
+├── test_connection.py               # Prueba de conexión Serial / WiFi
+│
+├── yolov8s-pose.pt                  # Modelo de pose (17 keypoints)
+├── yolo11n.pt                       # Modelo de detección de objetos
 ├── .env.example                     # Plantilla de variables de entorno
+│
+├── setup_sigo.bat                   # Instalador interactivo (recomendado)
 ├── run_sigo_local.bat               # Lanzador con Ollama (LLM local)
-├── setup_sigo.bat                   # Instalación automatizada (menú interactivo)
-├── setup_scrcpy.bat                 # Configuración de scrcpy (Android)
+├── setup_scrcpy.bat                 # Configurar scrcpy (Android)
 ├── launch_scrcpy_wireless.bat       # Conexión wireless scrcpy
 │
-├── Utilidades
-│   ├── calibrate_distance.py        # Calibración de distancias por pose
-│   └── test_connection.py           # Prueba de conexión Serial/WiFi
+├── calibration/                     # Archivos de calibración de cámara
+│   ├── calINSPIRO.npz
+│   └── calS24.npz
 │
-├── calibration/
-│   ├── calINSPIRO.npz               # Calibración de cámara (estándar)
-│   └── calS24.npz                   # Calibración de cámara (Samsung S24)
-│
-├── requirements/
-│   ├── requirements.txt             # Dependencias principales
-│   ├── requirements-cpu.txt         # Optimizado para CPU
-│   ├── requirements-performance.txt # Paquetes de rendimiento
-│   └── requirements-face.txt        # Reconocimiento facial (onnxruntime-gpu)
+├── requirements/                    # Dependencias (pip)
+│   ├── requirements.txt
+│   ├── requirements-cpu.txt
+│   ├── requirements-face.txt
+│   └── requirements-performance.txt
 │
 ├── face_database/                   # Base de datos facial (empieza vacía)
 │
-└── docs/
-    ├── README.md                    # Documentación completa (inglés)
-    ├── KEYBINDS.md                  # Atajos de teclado
-    ├── INSTALLATION.md              # Instrucciones de instalación
-    ├── FACE_RECOGNITION.md          # Guía de reconocimiento facial
-    ├── POSE_DISTANCE_INTEGRATION.md # Estimación de distancia por pose
-    └── ... (más documentos)
+└── docs/                            # Documentación extendida
+    ├── KEYBINDS.md
+    ├── INSTALLATION.md
+    ├── FACE_RECOGNITION.md
+    ├── POSE_DISTANCE_INTEGRATION.md
+    └── ...
 ```
 
 ## 🚀 Inicio Rápido
@@ -122,6 +121,8 @@ go to Juan                   ← Navegar hacia Juan
 - ✅ Control manual y autónomo
 - ✅ GUI dual: System Log + Command Console
 - ✅ Video de múltiples fuentes (webcam/IP/scrcpy/Smart View)
+- ✅ Reconocimiento gestual (mano alzada = ven, ambas manos = alto)
+- ✅ Comandos de voz con números en palabras ("persona uno" → persona 1)
 
 ## 🎮 Controles
 
@@ -134,17 +135,20 @@ go to Juan                   ← Navegar hacia Juan
 | `6` | Modo velocidad segura |
 | `7` | Activar/desactivar control manual |
 | `8` | Activar/desactivar reconocimiento gestual |
+| `9` | Buscar persona (escaneo 360°) |
 
 ### Modo Manual (tecla `7`)
-| Tecla | Acción | Bit |
-|-------|--------|-----|
-| `J` | Rotar anti-horario | 0 |
-| `L` | Rotar horario | 1 |
-| `I` | Izquierda | 2 |
-| `K` | Derecha | 3 |
-| `U` | Avanzar | 4 |
-| `O` | Retroceder | 5 |
-| `F` | Velocidad rápida | 7 |
+| Tecla | Acción |
+|-------|--------|
+| `J` | Rotar anti-horario |
+| `L` | Rotar horario |
+| `I` | Subir |
+| `K` | Bajar |
+| `U` | Avanzar |
+| `O` | Retroceder |
+| `N` | Strafe izquierda |
+| `M` | Strafe derecha |
+| `F` | Velocidad rápida (modificador) |
 
 ## 💬 Ejemplos de Comandos
 
@@ -155,8 +159,8 @@ Texto: "ve a la persona 1"
        "save person 1 as Juan"
        "remove Juan"
 
-Voz:   "Ve a la persona uno"
-       "Sigue a Juan"
+Voz:   "Ve a la persona uno"       ← convierte 'uno' → 1
+       "Sigue al número tres"     ← convierte 'tres' → 3
        "Busca a María"
 ```
 
@@ -215,5 +219,5 @@ Uso de Investigación/Educativo
 ---
 
 **Autor**: Yosef
-**Versión**: 2.0
-**Actualizado**: Febrero 2026
+**Versión**: 2.1
+**Actualizado**: Marzo 2026

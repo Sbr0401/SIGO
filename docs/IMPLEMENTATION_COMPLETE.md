@@ -151,7 +151,7 @@ The system will:
 ### Test Individual Components:
 
 **Test Voice Recognition:**
-- Press '3' to record voice command
+- Press 'Shift+3' to record voice command
 - Should transcribe in ~0.5s (vs 4s before)
 
 **Test Object Detection:**

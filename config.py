@@ -232,21 +232,21 @@ class KeybindConfig:
     KEY_ARROW_UP = 72  # Up arrow (second byte)
     KEY_ARROW_DOWN = 80  # Down arrow (second byte)
     
-    # Voice control
-    KEY_VOICE_RECORD = '3'  # Hold to record voice
+    # Voice control  (Shift+number — layout-independent via keyboard library)
+    KEY_VOICE_RECORD = 'shift+3'  # Hold to record voice
     
     # Navigation controls
-    KEY_CANCEL_NAV = '5'  # Cancel active navigation
-    KEY_SAFE_MODE = ord('6')  # Toggle safe speed mode
+    KEY_CANCEL_NAV = 'shift+5'  # Cancel active navigation / emergency stop
+    KEY_SAFE_MODE = 'shift+6'  # Toggle safe speed mode
     
     # Feature toggles
-    KEY_FACE_RECOGNITION = ord('4')  # Toggle face recognition
-    KEY_GESTURE_MODE = ord('8')      # Toggle gesture recognition (F1)
-    KEY_FIND_PERSON = ord('9')       # Find person by name (360° scan)
+    KEY_FACE_RECOGNITION = 'shift+4'  # Toggle face recognition
+    KEY_GESTURE_MODE = 'shift+8'      # Toggle gesture recognition (F1)
+    KEY_FIND_PERSON = 'shift+9'       # Find person by name (360° scan)
     
     # Mode switching
-    KEY_MANUAL_TOGGLE = '7'  # Toggle manual control mode
-    KEY_MANUAL_EXIT = '7'  # Exit manual mode
+    KEY_MANUAL_TOGGLE = 'shift+7'  # Toggle manual control mode
+    KEY_MANUAL_EXIT = 'shift+7'  # Exit manual mode
     
     # Manual control mapping (key: bit position)
     MANUAL_ROTATE_CCW = 'j'  # Rotate counter-clockwise - Bit 0

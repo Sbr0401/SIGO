@@ -102,7 +102,7 @@ class AIConfig:
     FACE_RECOGNITION_THRESHOLD = 0.35  # Cosine similarity (0-1, lower = stricter)
 ```
 
-**Runtime Toggle:** Press **4** to toggle face recognition on/off.
+**Runtime Toggle:** Press **Shift+4** to toggle face recognition on/off.
 
 ## Database Structure
 
@@ -174,7 +174,7 @@ Download the buffalo_l model pack:
 
 | Key | Action |
 |-----|--------|
-| `4` | Toggle face recognition on/off |
-| `3` (hold) | Record voice command |
-| `5` | Cancel navigation |
+| `Shift+4` | Toggle face recognition on/off |
+| `Shift+3` (hold) | Record voice command |
+| `Shift+5` | Cancel navigation |
 | `TAB` | Exit SIGO |

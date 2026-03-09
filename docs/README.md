@@ -9,7 +9,6 @@ Control your robot/vehicle using natural language commands, voice, and computer 
 - 🎥 **Multi-source video**: Local webcam, Android (scrcpy), Smart View/Miracast, MJPEG stream, or IP camera
 - 🔍 **Person tracking**: YOLOv8-Pose with distance estimation from body keypoints (primary mode)
 - 👤 **Facial recognition**: ArcFace via ONNX Runtime — identify enrolled people in real-time
-- 🤖 **AI object detection**: YOLOv11 for identifying people, vehicles, objects
 - 🗣️ **Voice control**: Spanish voice commands via faster-whisper
 - 🧠 **Natural language**: GPT-4 / Ollama (local LLM) interprets commands like "go to John"
 - 🎮 **Manual control**: Direct keyboard control for testing
@@ -64,15 +63,16 @@ On first run, YOLO models are downloaded automatically by Ultralytics (~6MB for 
 - `Enter` — Send text command
 - `↑/↓` — Navigate command history
 - `Backspace` — Edit command
-- `3` (hold) — Record 4-second voice command
-- `4` — Toggle face recognition
-- `5` — Cancel current navigation
-- `6` — Toggle safe speed mode
-- `7` — Toggle manual control mode
-- `8` — Toggle gesture recognition
+- `Shift+3` (hold) — Record 4-second voice command
+- `Shift+4` — Toggle face recognition
+- `Shift+5` — Emergency stop / cancel navigation
+- `Shift+6` — Toggle safe speed mode
+- `Shift+7` — Toggle manual control mode
+- `Shift+8` — Toggle gesture recognition
+- `Shift+9` — Find person (360° scan)
 - `TAB` — Exit program
 
-**Manual Mode (press `7` to enter/exit):**
+**Manual Mode (press `Shift+7` to enter/exit):**
 - `J` — Rotate counter-clockwise (Bit 0)
 - `L` — Rotate clockwise (Bit 1)
 - `I` — Left (Bit 2)
@@ -112,7 +112,7 @@ SIGO identifies people using ArcFace embeddings via ONNX Runtime (no TensorFlow/
    ```
 
 2. **Enable/disable** at runtime:
-   - Press `4` to toggle face recognition on/off
+   - Press `Shift+4` to toggle face recognition on/off
    - Or set `Config.AI.USE_FACE_RECOGNITION = True/False` in `config.py`
 
 3. **Navigate to a person**:

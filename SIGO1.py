@@ -144,13 +144,13 @@ except ImportError:
             KEY_EXIT = 9
             KEY_BACKSPACE = 8
             KEY_ENTER = 13
-            KEY_VOICE_RECORD = '3'
-            KEY_CANCEL_NAV = '5'
-            KEY_SAFE_MODE = ord('6')
-            KEY_FACE_RECOGNITION = ord('4')
-            KEY_GESTURE_MODE = ord('8')
-            KEY_MANUAL_TOGGLE = '7'
-            KEY_MANUAL_EXIT = '7'
+            KEY_VOICE_RECORD = 'shift+3'
+            KEY_CANCEL_NAV = 'shift+5'
+            KEY_SAFE_MODE = 'shift+6'
+            KEY_FACE_RECOGNITION = 'shift+4'
+            KEY_GESTURE_MODE = 'shift+8'
+            KEY_MANUAL_TOGGLE = 'shift+7'
+            KEY_MANUAL_EXIT = 'shift+7'
         class Performance:
             FRAME_QUEUE_SIZE = 1
             FRAMERATE_MODE = 'auto'
@@ -243,22 +243,30 @@ def resolve_face_database_dir() -> str:
 _tts_queue: Queue = Queue(maxsize=10)
 _tts_engine = None
 _tts_thread_started = False
+_tts_cooldown = 5.0        # seconds between TTS utterances
+_tts_last_speak = 0.0      # timestamp of last accepted tts_speak call
+
+def _tts_init_engine():
+    """Create (or recreate) a fresh pyttsx3 engine. Returns engine or None."""
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 170)
+        engine.setProperty('volume', 0.9)
+        voices = engine.getProperty('voices')
+        for v in voices:
+            if 'female' in v.name.lower() or 'zira' in v.name.lower():
+                engine.setProperty('voice', v.id)
+                break
+        return engine
+    except Exception as e:
+        print(f"[TTS] Init failed: {e}")
+        return None
 
 def _tts_worker():
     """Background thread: reads text from _tts_queue and speaks it."""
     global _tts_engine
-    try:
-        _tts_engine = pyttsx3.init()
-        _tts_engine.setProperty('rate', 170)   # Words per minute
-        _tts_engine.setProperty('volume', 0.9)
-        # Try to pick a female voice for variety
-        voices = _tts_engine.getProperty('voices')
-        for v in voices:
-            if 'female' in v.name.lower() or 'zira' in v.name.lower():
-                _tts_engine.setProperty('voice', v.id)
-                break
-    except Exception as e:
-        print(f"[TTS] Init failed: {e}")
+    _tts_engine = _tts_init_engine()
+    if _tts_engine is None:
         return
 
     while True:
@@ -268,8 +276,17 @@ def _tts_worker():
                 break  # Poison pill
             _tts_engine.say(text)
             _tts_engine.runAndWait()
-        except Exception:
-            pass  # Don't crash the TTS thread
+        except Exception as e:
+            print(f"[TTS] Error, reinitializing engine: {e}")
+            # pyttsx3 engine is likely dead — rebuild it
+            try:
+                _tts_engine.stop()
+            except Exception:
+                pass
+            _tts_engine = _tts_init_engine()
+            if _tts_engine is None:
+                print("[TTS] Reinit failed, TTS disabled for this session")
+                break
 
 def _tts_shutdown():
     """Cleanly stop the TTS engine to avoid pyttsx3 DriverProxy.__del__ error."""
@@ -287,10 +304,14 @@ def _tts_shutdown():
         _tts_engine = None
 
 def tts_speak(text: str):
-    """Enqueue text for TTS playback (non-blocking). Drops if queue full."""
-    global _tts_thread_started
+    """Enqueue text for TTS playback (non-blocking). Respects cooldown. Drops if queue full."""
+    global _tts_thread_started, _tts_last_speak
     if not TTS_AVAILABLE:
         return
+    now = time.time()
+    if now - _tts_last_speak < _tts_cooldown:
+        return  # cooldown active — skip this utterance
+    _tts_last_speak = now
     if not _tts_thread_started:
         _tts_thread_started = True
         t = threading.Thread(target=_tts_worker, daemon=True)
@@ -298,7 +319,7 @@ def tts_speak(text: str):
     try:
         _tts_queue.put_nowait(text)
     except Full:
-        pass  # Drop oldest-intent rather than blocking
+        pass  # Drop rather than blocking
 
 # ==========================
 #  ARDUINO AUTO-DETECT & PROTOCOL
@@ -916,27 +937,6 @@ def detect_gesture(kpts, gesture_history: deque, bbox=None) -> Optional[str]:
 
     return GESTURE_NONE
 
-# ==========================
-#  OBSTACLE DETECTION CLASSES (F6)
-# ==========================
-# COCO class IDs for common obstacles (used by YOLO 80-class models)
-OBSTACLE_CLASSES = [
-    # Vehicles
-    2, 3, 5, 7,   # car, motorcycle, bus, truck
-    # Outdoor objects
-    9, 10, 11, 12, 13,  # traffic light, fire hydrant, stop sign, parking meter, bench
-    # Animals
-    15, 16, 17, 18, 19, 20, 21, 22, 23,  # cat through giraffe
-    # Furniture / indoor
-    56, 57, 58, 59, 60,  # chair, couch, potted plant, bed, dining table
-    # Electronics
-    62, 63, 72,  # tv, laptop, refrigerator
-    # Misc
-    24, 25, 28, 39, 64,  # backpack, umbrella, suitcase, bottle, mouse
-]
-OBSTACLE_DETECT_INTERVAL = 5   # Run obstacle detection every N frames
-OBSTACLE_CONFIDENCE = 0.40     # Lower threshold since we want safety-first
-
 def estimate_body_orientation(kpts):
     """
     Estimate how much the person is facing the camera (0.0 = fully sideways, 1.0 = fully frontal).
@@ -1479,15 +1479,11 @@ class VideoProcessor:
         self.gesture_active = {}          # person_id -> current gesture string or None
         self.gesture_nav_target = None    # person_id currently being navigated to via gesture
         self.cancel_nav_event = threading.Event()  # set by gesture BOTH_HANDS_UP to cancel navigation
-        self._find_person_pending = False  # True when waiting for name input after hotkey 9
+        self._find_person_pending = False  # True when waiting for name input after Shift+9
         self._find_person_choice = None   # person_id waiting for go/follow response
         
         # F4: TTS enabled flag (speaks navigation events)
         self.tts_enabled = TTS_AVAILABLE
-        
-        # F6: Obstacle awareness
-        self.obstacle_detections = []     # [(class_name, bbox, confidence), ...]
-        self._obstacle_frame_counter = 0  # frame counter for throttled detection
         
         # GUI
         self.console = ConsoleBuffer()       # System log (fast updates, detection info)
@@ -2017,12 +2013,6 @@ class VideoProcessor:
         # Face recognition on detected persons (uses keypoints — zero extra detection cost)
         if self.face_recognition_enabled and self.face_system:
             self._recognize_faces(frame, seen_persons)
-        
-        # --- F6: Obstacle detection (throttled) ---
-        self._obstacle_frame_counter += 1
-        if self._obstacle_frame_counter >= OBSTACLE_DETECT_INTERVAL:
-            self._obstacle_frame_counter = 0
-            self._detect_obstacles(frame)
     
     def _process_gestures(self, seen_persons):
         """F1: Detect gestures from keypoints and trigger actions.
@@ -2068,7 +2058,6 @@ class VideoProcessor:
                 if self.guided_mode:
                     self.gesture_nav_target = None
                     self.cancel_nav_event.set()
-                    self.cmd_console.submit_command(Config.Keybinds.KEY_CANCEL_NAV)
                 continue
 
             # --- HAND_RAISED: one-shot persistent navigation trigger ---
@@ -2092,44 +2081,6 @@ class VideoProcessor:
                 # Mark as gesture-initiated navigation (persists after hand lowered)
                 self.gesture_nav_target = pid
                 self.cmd_console.submit_command(f"go to person {person_num}")
-    
-    def _detect_obstacles(self, frame):
-        """F6: Run YOLO obstacle detection for non-person objects."""
-        if self.yolo is None:
-            # Lazy load YOLO model
-            model_name = getattr(getattr(Config, 'AI', None), 'YOLO_MODEL', 'yolo11n.pt')
-            model_path = os.path.join(_SCRIPT_DIR, model_name) if not os.path.isabs(model_name) else model_name
-            try:
-                self.yolo = YOLO(model_path)
-                self.object_classes = self.yolo.names
-            except Exception as e:
-                print(f"[F6] YOLO load failed: {e}")
-                return
-        
-        yolo_device = 0 if self.pose_device == 'cuda' else 'cpu'
-        try:
-            results = self.yolo(frame, conf=OBSTACLE_CONFIDENCE, verbose=False,
-                                device=yolo_device, classes=OBSTACLE_CLASSES)
-        except Exception:
-            try:
-                results = self.yolo(frame, conf=OBSTACLE_CONFIDENCE, verbose=False,
-                                    device='cpu', classes=OBSTACLE_CLASSES)
-            except Exception:
-                return
-        
-        obstacles = []
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                cls_id = int(box.cls.cpu())
-                conf = float(box.conf.cpu())
-                cls_name = self.object_classes.get(cls_id, f"obj_{cls_id}")
-                obstacles.append((cls_name, (x1, y1, x2, y2), conf))
-        
-        with self.lock:
-            self.obstacle_detections = obstacles
     
     def _recognize_faces(self, frame, person_ids):
         """Recognise faces using pose keypoints + ArcFace embeddings."""
@@ -2288,14 +2239,6 @@ class VideoProcessor:
                         lbl = f"{self.object_classes[obj['class_id']]} {obj['confidence']:.0%}"
                         cv2.putText(out, lbl, (ox1, oy1 - 6), font, 0.40, (255, 80, 80), 1, LT)
 
-        # --- F6: Render obstacle detections ---
-        with self.lock:
-            obstacles = list(self.obstacle_detections)
-        if obstacles:
-            for cls_name, (ox1, oy1, ox2, oy2), conf in obstacles:
-                cv2.rectangle(out, (ox1, oy1), (ox2, oy2), (0, 0, 255), 1, LT)
-                cv2.putText(out, f"! {cls_name} {conf:.0%}", (ox1, oy1 - 6), font, 0.40, (0, 0, 255), 1, LT)
-        
         # --- F1: Gesture mode indicator ---
         if self.gesture_mode:
             cv2.putText(out, "GESTURE MODE ON", (w - 220, 30), font, 0.55, (0, 255, 255), 2, LT)
@@ -3229,7 +3172,7 @@ def _find_person_scan(proc, name: str):
             if found_pid:
                 break
 
-            # Cancel if user presses 5
+            # Cancel if user presses Shift+5
             if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV):
                 proc.cmd_console.add_output("🛑 Find scan cancelled.")
                 if proc.tts_enabled:
@@ -3595,7 +3538,7 @@ def prompt_thread(proc):
                 proc.cmd_console.add_output(f"❌ '{target_name}' not found in database. Known: {', '.join(known) if known else '(empty)'}")
             continue
 
-        if last_command == Config.Keybinds.KEY_MANUAL_TOGGLE:
+        if last_command == '__manual__':
             with proc.manual_mode_lock:
                 proc.manual_mode = not proc.manual_mode
                 entering_manual = proc.manual_mode
@@ -3739,7 +3682,7 @@ def prompt_thread(proc):
             while not proc.stop_event.is_set():
                 if keyboard.is_pressed(Config.Keybinds.KEY_CANCEL_NAV) or proc.cancel_nav_event.is_set():
                     proc.cancel_nav_event.clear()
-                    proc.cmd_console.add_output(f"🛑 MODO NAVEGACIÓN CANCELADO (tecla {Config.Keybinds.KEY_CANCEL_NAV.upper()})")
+                    proc.cmd_console.add_output(f"🛑 MODO NAVEGACIÓN CANCELADO (Shift+5)")
                     if proc.tts_enabled:
                         tts_speak("Navigation cancelled")
                     break
@@ -3765,17 +3708,6 @@ def prompt_thread(proc):
                         
                 nav_info = print_navigation_commands({'id': chosen_id, **marker_data}, DISTANCE_TARGET, follow)
                 proc.console.add_output(nav_info)
-                
-                # F6: Warn about obstacles in path during navigation
-                with proc.lock:
-                    nav_obstacles = list(proc.obstacle_detections)
-                if nav_obstacles and not hasattr(proc, '_last_obstacle_warn') or \
-                   (nav_obstacles and time.time() - getattr(proc, '_last_obstacle_warn', 0) > 5.0):
-                    obstacle_names = list(set(o[0] for o in nav_obstacles[:3]))
-                    proc.cmd_console.add_output(f"⚠️ Obstacles detected: {', '.join(obstacle_names)}")
-                    if proc.tts_enabled:
-                        tts_speak(f"Warning, {obstacle_names[0]} ahead")
-                    proc._last_obstacle_warn = time.time()
                 
                 try:
                     send_commands_byte({'id': chosen_id, **marker_data}, DISTANCE_TARGET)
@@ -4214,6 +4146,7 @@ def display_thread(proc):
     first_frame = True
     last_rendered_gen = -1
     cached_display = None
+    _hk_prev = {}  # edge-detection state for keyboard.is_pressed hotkeys
     
     while not proc.stop_event.is_set():
         if proc.processed_frame is None:
@@ -4255,8 +4188,16 @@ def display_thread(proc):
             proc.stop_event.set()
             break  # Salir inmediatamente del loop
 
-        # ── EMERGENCY STOP (key 5) — halts ALL movement regardless of state ──
-        if key == ord(Config.Keybinds.KEY_CANCEL_NAV):
+        # ── Shift+number hotkeys (keyboard lib — layout-independent) ──
+        def _hk_edge(name):
+            """Return True on rising-edge of keyboard.is_pressed(name)."""
+            cur = keyboard.is_pressed(name)
+            prev = _hk_prev.get(name, False)
+            _hk_prev[name] = cur
+            return cur and not prev
+
+        # ── EMERGENCY STOP (Shift+5) — halts ALL movement regardless of state ──
+        if _hk_edge(Config.Keybinds.KEY_CANCEL_NAV):
             proc.cancel_nav_event.set()          # breaks navigation loop
             proc.gesture_nav_target = None       # clear gesture nav
             proc._find_person_pending = False    # cancel find-person prompt
@@ -4288,14 +4229,8 @@ def display_thread(proc):
             if proc.manual_mode:
                 continue
 
-        if key == Config.Keybinds.KEY_BACKSPACE:
-            proc.cmd_console.backspace()
-        elif key == Config.Keybinds.KEY_ENTER:
-            if proc.cmd_console.get_input():
-                cmd = proc.cmd_console.get_input()
-                proc.cmd_console.submit_command(cmd)
-        elif key == Config.Keybinds.KEY_FACE_RECOGNITION:
-            # Toggle face recognition on/off
+        # ── Shift+4: Toggle face recognition ──
+        if _hk_edge(Config.Keybinds.KEY_FACE_RECOGNITION):
             if FACE_RECOGNITION_AVAILABLE:
                 proc.face_recognition_enabled = not proc.face_recognition_enabled
                 if proc.face_recognition_enabled:
@@ -4306,7 +4241,6 @@ def display_thread(proc):
                             proc.face_system = LiveFaceRecognition(
                                 database_dir=db_dir
                             )
-                            # Auto-enroll from existing photos in face_database/{Name}/
                             auto_count = proc.face_system.auto_enroll_from_photos()
                             people = proc.face_system.list_people()
                             msg = f"✅ Face recognition ON ({len(people)} enrolled)"
@@ -4318,7 +4252,6 @@ def display_thread(proc):
                             proc.cmd_console.add_output(f"❌ Face recognition error: {e}")
                             proc.face_recognition_enabled = False
                     else:
-                        # Re-scan for new photos added while running
                         auto_count = proc.face_system.auto_enroll_from_photos()
                         people = proc.face_system.list_people()
                         msg = f"✅ Face recognition ON ({len(people)} enrolled)"
@@ -4329,13 +4262,21 @@ def display_thread(proc):
                     proc.cmd_console.add_output("⏸️ Face recognition OFF")
             else:
                 proc.cmd_console.add_output("❌ Face recognition unavailable (onnxruntime + ArcFace model required)")
-        elif key == Config.Keybinds.KEY_SAFE_MODE:
+
+        # ── Shift+6: Toggle safe mode ──
+        elif _hk_edge(Config.Keybinds.KEY_SAFE_MODE):
             now_safe = toggle_nav_safe_mode()
             if now_safe:
                 proc.cmd_console.add_output("🛡️ Modo Seguro ACTIVADO — velocidades más lentas")
             else:
                 proc.cmd_console.add_output("⚙️ Modo Seguro DESACTIVADO — velocidades adaptativas")
-        elif key == getattr(Config.Keybinds, 'KEY_GESTURE_MODE', ord('8')):
+
+        # ── Shift+7: Toggle manual mode ──
+        elif _hk_edge(Config.Keybinds.KEY_MANUAL_TOGGLE):
+            proc.cmd_console.submit_command('__manual__')
+
+        # ── Shift+8: Toggle gesture recognition ──
+        elif _hk_edge(Config.Keybinds.KEY_GESTURE_MODE):
             proc.gesture_mode = not proc.gesture_mode
             if proc.gesture_mode:
                 proc.cmd_console.add_output("🤚 Gesture recognition ON (hand raised = come here, both hands = stop)")
@@ -4346,13 +4287,14 @@ def display_thread(proc):
                 proc.gesture_active.clear()
                 if proc.tts_enabled:
                     tts_speak("Gesture mode deactivated")
-        elif key == getattr(Config.Keybinds, 'KEY_FIND_PERSON', ord('9')):
+
+        # ── Shift+9: Find person ──
+        elif _hk_edge(Config.Keybinds.KEY_FIND_PERSON):
             if not proc.face_system:
-                proc.cmd_console.add_output("❌ Face recognition not loaded. Press 4 first.")
+                proc.cmd_console.add_output("❌ Face recognition not loaded. Press Shift+4 first.")
             elif proc.guided_mode:
-                proc.cmd_console.add_output("⚠️ Navigation already active. Cancel with 5 first.")
+                proc.cmd_console.add_output("⚠️ Navigation already active. Cancel with Shift+5 first.")
             else:
-                # Prompt for name — submit it as a find command
                 known = proc.face_system.list_people()
                 if not known:
                     proc.cmd_console.add_output("❌ No faces enrolled in database.")
@@ -4360,6 +4302,14 @@ def display_thread(proc):
                     proc.cmd_console.add_output(f"🔎 FIND PERSON — enrolled: {', '.join(known)}")
                     proc.cmd_console.add_output("   Type the name and press Enter:")
                     proc._find_person_pending = True
+
+        # ── Text input (cv2.waitKey — arrows, backspace, enter, printable) ──
+        elif key == Config.Keybinds.KEY_BACKSPACE:
+            proc.cmd_console.backspace()
+        elif key == Config.Keybinds.KEY_ENTER:
+            if proc.cmd_console.get_input():
+                cmd = proc.cmd_console.get_input()
+                proc.cmd_console.submit_command(cmd)
         elif key in Config.Keybinds.KEY_ARROW_PREFIX:
             key2 = cv2.waitKey(1) & 0xFF
             if key2 == Config.Keybinds.KEY_ARROW_UP:
@@ -4367,18 +4317,7 @@ def display_thread(proc):
             elif key2 == Config.Keybinds.KEY_ARROW_DOWN:
                 proc.cmd_console.history_down()
         elif 32 <= key <= 126:
-            # Skip number-row hotkeys so they don't get typed as text
-            hotkey_codes = {
-                ord(Config.Keybinds.KEY_VOICE_RECORD),      # 3
-                Config.Keybinds.KEY_FACE_RECOGNITION,        # 4
-                ord(Config.Keybinds.KEY_CANCEL_NAV),         # 5
-                Config.Keybinds.KEY_SAFE_MODE,               # 6
-                ord(Config.Keybinds.KEY_MANUAL_TOGGLE),      # 7
-                getattr(Config.Keybinds, 'KEY_GESTURE_MODE', ord('8')),  # 8
-                getattr(Config.Keybinds, 'KEY_FIND_PERSON', ord('9')),   # 9
-            }
-            if key not in hotkey_codes:
-                proc.cmd_console.add_to_input(chr(key))
+            proc.cmd_console.add_to_input(chr(key))
         
     cv2.destroyAllWindows()
 
@@ -4675,13 +4614,13 @@ if __name__ == '__main__':
     proc.cmd_console.add_output("")
     proc.cmd_console.add_output("⌨️  CONTROLES:")
     proc.cmd_console.add_output(f"   TAB = Salir del programa")
-    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_VOICE_RECORD} = Grabar comando de voz")
-    proc.cmd_console.add_output(f"   {chr(Config.Keybinds.KEY_FACE_RECOGNITION)} = Reconocimiento facial")
-    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_CANCEL_NAV} = EMERGENCY STOP (halts all movement)")
-    proc.cmd_console.add_output(f"   6 = Toggle Modo Seguro (velocidad mínima)")
-    proc.cmd_console.add_output(f"   {Config.Keybinds.KEY_MANUAL_TOGGLE} = Modo manual")
-    proc.cmd_console.add_output(f"   8 = Toggle gesture recognition")
-    proc.cmd_console.add_output(f"   9 = Find person (360° scan)")
+    proc.cmd_console.add_output(f"   Shift+3 = Grabar comando de voz")
+    proc.cmd_console.add_output(f"   Shift+4 = Reconocimiento facial")
+    proc.cmd_console.add_output(f"   Shift+5 = EMERGENCY STOP (halts all movement)")
+    proc.cmd_console.add_output(f"   Shift+6 = Toggle Modo Seguro (velocidad mínima)")
+    proc.cmd_console.add_output(f"   Shift+7 = Modo manual")
+    proc.cmd_console.add_output(f"   Shift+8 = Toggle gesture recognition")
+    proc.cmd_console.add_output(f"   Shift+9 = Find person (360° scan)")
     proc.cmd_console.add_output(f"   TTS: {'ON' if proc.tts_enabled else 'OFF (pyttsx3 not installed)'}")
     proc.cmd_console.add_output("")
 

@@ -15,7 +15,7 @@ SIGO-FINAL/
 ├── test_connection.py               # Prueba de conexión Serial / WiFi
 │
 ├── yolov8s-pose.pt                  # Modelo de pose (17 keypoints)
-├── yolo11n.pt                       # Modelo de detección de objetos
+├── yolo11n.pt                       # YOLO fallback (detección de personas)
 ├── .env.example                     # Plantilla de variables de entorno
 │
 ├── setup_sigo.bat                   # Instalador interactivo (recomendado)
@@ -129,15 +129,15 @@ go to Juan                   ← Navegar hacia Juan
 | Tecla | Acción |
 |-----|--------|
 | `TAB` | Salir de SIGO |
-| `3` (mantener) | Grabar comando de voz (4 segundos) |
-| `4` | Activar/desactivar reconocimiento facial |
-| `5` | Cancelar navegación |
-| `6` | Modo velocidad segura |
-| `7` | Activar/desactivar control manual |
-| `8` | Activar/desactivar reconocimiento gestual |
-| `9` | Buscar persona (escaneo 360°) |
+| `Shift+3` (mantener) | Grabar comando de voz (4 segundos) |
+| `Shift+4` | Activar/desactivar reconocimiento facial |
+| `Shift+5` | Emergency stop / cancelar navegación |
+| `Shift+6` | Modo velocidad segura |
+| `Shift+7` | Activar/desactivar control manual |
+| `Shift+8` | Activar/desactivar reconocimiento gestual |
+| `Shift+9` | Buscar persona (escaneo 360°) |
 
-### Modo Manual (tecla `7`)
+### Modo Manual (`Shift+7`)
 | Tecla | Acción |
 |-------|--------|
 | `J` | Rotar anti-horario |

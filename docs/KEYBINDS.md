@@ -19,17 +19,24 @@ Todos los keybinds se pueden modificar en **`config.py`** → Clase **`KeybindCo
 ### Control por Voz
 | Tecla | Función | Config Variable |
 |-------|---------|-----------------|
-| **3** (mantener) | Grabar voz con Whisper | `KEY_VOICE_RECORD = '3'` |
+| **Shift+3** (mantener) | Grabar voz con Whisper | `KEY_VOICE_RECORD = 'shift+3'` |
 
 ### Navegación
 | Tecla | Función | Config Variable |
-|-------|---------|-----------------|
-| **5** | Cancelar navegación activa | `KEY_CANCEL_NAV = '5'` |
+|-------|---------|------------------|
+| **Shift+5** | Emergency stop / cancelar navegación | `KEY_CANCEL_NAV = 'shift+5'` |
+| **Shift+6** | Toggle modo seguro (velocidad mínima) | `KEY_SAFE_MODE = 'shift+6'` |
 
 ### Reconocimiento Facial
 | Tecla | Función | Config Variable |
 |-------|---------|------------------|
-| **4** | Activar/desactivar reconocimiento facial | `KEY_FACE_RECOGNITION = ord('4')` |
+| **Shift+4** | Activar/desactivar reconocimiento facial | `KEY_FACE_RECOGNITION = 'shift+4'` |
+
+### Reconocimiento Gestual
+| Tecla | Función | Config Variable |
+|-------|---------|------------------|
+| **Shift+8** | Activar/desactivar reconocimiento gestual | `KEY_GESTURE_MODE = 'shift+8'` |
+| **Shift+9** | Buscar persona por nombre (escaneo 360°) | `KEY_FIND_PERSON = 'shift+9'` |
 
 ---
 
@@ -38,8 +45,8 @@ Todos los keybinds se pueden modificar en **`config.py`** → Clase **`KeybindCo
 ### Activación
 | Comando | Función | Config Variable |
 |---------|---------|-----------------|
-| **7** (en consola) | Activar/desactivar modo manual | `KEY_MANUAL_TOGGLE = '7'` |
-| **7** (en modo manual) | Salir del modo manual | `KEY_MANUAL_EXIT = '7'` |
+| **Shift+7** | Activar/desactivar modo manual | `KEY_MANUAL_TOGGLE = 'shift+7'` |
+| **Shift+7** (en modo manual) | Salir del modo manual | `KEY_MANUAL_EXIT = 'shift+7'` |
 
 ### Controles de Movimiento
 | Tecla | Función | Bit | Config Variable |
@@ -66,19 +73,19 @@ class KeybindConfig:
     # Cambiar tecla de salida (ejemplo: de TAB a ESC)
     KEY_EXIT = 27  # ESC key code
     
-    # Cambiar tecla de voz (ejemplo: de 3 a SPACE)
-    KEY_VOICE_RECORD = ' '  # Space bar
+    # Cambiar tecla de voz
+    KEY_VOICE_RECORD = 'shift+3'
     
     # Cambiar controles manuales (ejemplo: WASD style)
-    MANUAL_ROTATE_CCW = 'a'  # En lugar de 'j'
-    MANUAL_ROTATE_CW = 'd'   # En lugar de 'l'
-    MANUAL_LEFT = 'w'         # Izquierda, en lugar de 'i'
-    MANUAL_RIGHT = 's'        # Derecha, en lugar de 'k'
-    MANUAL_FORWARD = 'e'     # En lugar de 'u'
-    MANUAL_BACK = 'q'        # En lugar de 'o'
+    MANUAL_ROTATE_CCW = 'a'
+    MANUAL_ROTATE_CW = 'd'
+    MANUAL_LEFT = 'w'
+    MANUAL_RIGHT = 's'
+    MANUAL_FORWARD = 'e'
+    MANUAL_BACK = 'q'
     
     # Cambiar tecla de cancelar navegación
-    KEY_CANCEL_NAV = 'x'  # En lugar de '5'
+    KEY_CANCEL_NAV = 'shift+5'
 ```
 
 ### Códigos de Teclas Comunes (OpenCV)
@@ -151,7 +158,7 @@ class KeybindConfig:
 ### Comandos de Texto
 | Comando | Función |
 |---------|---------|
-| `7` | Activar/desactivar modo manual |
+| `Shift+7` | Activar/desactivar modo manual |
 | `go to person 1` | Navegar a persona 1 |
 | `follow person 2` | Seguir a persona 2 || `go to Juan` | Navegar a persona identificada como Juan |
 | `follow Juan` | Seguir a persona identificada como Juan |
@@ -159,7 +166,7 @@ class KeybindConfig:
 | `remove Juan` | Eliminar a Juan de la base de datos facial || `go to marker 5` | Navegar a marcador ArUco 5 |
 
 ### Comandos de Voz
-Mantén presionada la tecla configurada (`KEY_VOICE_RECORD`, por defecto **3**) y di:
+Mantén presionada la tecla configurada (`KEY_VOICE_RECORD`, por defecto **Shift+3**) y di:
 - "Ve a la persona uno"
 - "Sigue a la persona dos"
 - "Ve al marcador tres"

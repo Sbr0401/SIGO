@@ -205,7 +205,7 @@ Si tienes una RTX 5060/5070/5080/5090, necesitas PyTorch nightly con CUDA 12.8:
 ```bash
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
-
+            
 ## 🛠️ Soporte
 
 1. Consultar documentación en `docs/`
@@ -218,6 +218,6 @@ Uso de Investigación/Educativo
 
 ---
 
-**Autor**: Yosef
+**Autor**: Yosef Ali Jiemenez Muñoz, Santiago Basaldua Ramirez
 **Versión**: 2.1
 **Actualizado**: Marzo 2026

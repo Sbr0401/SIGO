@@ -218,6 +218,6 @@ Uso de Investigación/Educativo
 
 ---
 
-**Autor**: Yosef Ali Jiemenez Muñoz, Santiago Basaldua Ramirez
+**Autor**: Yosef Ali Jiemenez Muñoz, Santiago Basaldúa Ramírez
 **Versión**: 2.1
 **Actualizado**: Marzo 2026

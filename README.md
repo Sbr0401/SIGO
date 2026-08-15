@@ -1,5 +1,7 @@
 # SIGO — Sistema Inteligente de Guiado y Orientación
 
+https://drive.google.com/file/d/1Z3HzYJvE9dWnFNbCFnfp4e2z2GcUxTSf/view?usp=sharing
+
 > Sistema de navegación autónoma con IA para plataformas robóticas.
 > Detección de personas (YOLOv8-Pose), reconocimiento facial (ArcFace),
 > comandos de voz (Whisper) y control adaptativo vía Arduino.
